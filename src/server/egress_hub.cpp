@@ -82,7 +82,7 @@ void EgressHub::OnSocketConnected(int sockfd, int status) {
         RemoveSocket(sockfd);
         return;
     }
-    HVLOG(1) << fmt::format("egress type {} id {} sock {} connected", type(), id());
+    HVLOG(1) << fmt::format("egress type {} id {} sock {} connected", type(), id(), sockfd);
     if (absl::GetFlag(FLAGS_tcp_enable_nodelay)) {
         CHECK(utils::SetTcpSocketNoDelay(sockfd));
     }
