@@ -67,7 +67,7 @@ IOUring::IOUring()
     if (ret != 0) {
         LOG(FATAL) << "io_uring_register_files failed: " << ERRNO_LOGSTR(-ret);
     }
-    HLOG_F(INFO, "register {} fd slots", n_fd_slots);
+    // HLOG_F(INFO, "register {} fd slots", n_fd_slots);
     fds_.resize(n_fd_slots);
     free_fd_slots_.reserve(n_fd_slots);
     for (size_t i = 0; i < n_fd_slots; i++) {
@@ -120,7 +120,7 @@ bool IOUring::RegisterFd(int fd) {
         LOG(FATAL) << "io_uring_register_files_update failed: " << ERRNO_LOGSTR(-ret);
     }
     fd_indices_[fd] = index;
-    HLOG_F(INFO, "register fd {}, {} registered fds in total", fd, fd_indices_.size());
+    // HLOG_F(INFO, "register fd {}, {} registered fds in total", fd, fd_indices_.size());
     Descriptor* desc = &fds_[index];
     desc->fd = fd;
     desc->index = index;

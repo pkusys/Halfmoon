@@ -10,7 +10,7 @@ namespace log {
 
 class LRUCache {
 public:
-    explicit LRUCache(int mem_cap_mb);
+    explicit LRUCache(int mem_cap_mb, bool prefetch = false);
     ~LRUCache();
 
     void Put(const LogMetaData& log_metadata, std::span<const uint64_t> user_tags,
@@ -22,6 +22,7 @@ public:
 
 private:
     std::unique_ptr<tkrzw::CacheDBM> dbm_;
+    bool prefetch;
 
     DISALLOW_COPY_AND_ASSIGN(LRUCache);
 };

@@ -14,14 +14,12 @@ using protocol::SharedLogMessageHelper;
 using protocol::SharedLogOpType;
 
 Storage::Storage(uint16_t node_id)
-    : StorageBase(node_id),
-      log_header_(fmt::format("Storage[{}-N]: ", node_id)),
-      current_view_(nullptr),
-      view_finalized_(false) {}
+    : StorageBase(node_id), log_header_(fmt::format("Storage[{}-N]: ", node_id)),
+      current_view_(nullptr), view_finalized_(false) {}
 
 Storage::~Storage() {}
 
-void Storage::OnViewCreated(const View* view) {
+void Storage::OnViewCreated(const View *view) {
     DCHECK(zk_session()->WithinMyEventLoopThread());
     HLOG_F(INFO, "New view {} created", view->id());
     bool contains_myself = view->contains_storage_node(my_node_id());
@@ -36,8 +34,8 @@ void Storage::OnViewCreated(const View* view) {
                 if (!view->is_active_phylog(sequencer_id)) {
                     continue;
                 }
-                storage_collection_.InstallLogSpace(std::make_unique<LogStorage>(
-                    my_node_id(), view, sequencer_id));
+                storage_collection_.InstallLogSpace(
+                    std::make_unique<LogStorage>(my_node_id(), view, sequencer_id));
             }
         }
         future_requests_.OnNewView(view, contains_myself ? &ready_requests : nullptr);
@@ -48,14 +46,11 @@ void Storage::OnViewCreated(const View* view) {
     if (!ready_requests.empty()) {
         HLOG_F(INFO, "{} requests for the new view", ready_requests.size());
         SomeIOWorker()->ScheduleFunction(
-            nullptr, [this, requests = std::move(ready_requests)] () {
-                ProcessRequests(requests);
-            }
-        );
+            nullptr, [this, requests = std::move(ready_requests)]() { ProcessRequests(requests); });
     }
 }
 
-void Storage::OnViewFinalized(const FinalizedView* finalized_view) {
+void Storage::OnViewFinalized(const FinalizedView *finalized_view) {
     DCHECK(zk_session()->WithinMyEventLoopThread());
     HLOG_F(INFO, "View {} finalized", finalized_view->view()->id());
     LogStorage::ReadResultVec results;
@@ -65,8 +60,7 @@ void Storage::OnViewFinalized(const FinalizedView* finalized_view) {
         DCHECK_EQ(finalized_view->view()->id(), current_view_->id());
         storage_collection_.ForEachActiveLogSpace(
             finalized_view->view(),
-            [&, finalized_view] (uint32_t logspace_id,
-                                 LockablePtr<LogStorage> storage_ptr) {
+            [&, finalized_view](uint32_t logspace_id, LockablePtr<LogStorage> storage_ptr) {
                 log_utils::FinalizedLogSpace<LogStorage>(storage_ptr, finalized_view);
                 auto locked_storage = storage_ptr.Lock();
                 LogStorage::ReadResultVec tmp;
@@ -75,61 +69,50 @@ void Storage::OnViewFinalized(const FinalizedView* finalized_view) {
                 if (auto index_data = locked_storage->PollIndexData(); index_data.has_value()) {
                     index_data_vec.push_back(std::move(*index_data));
                 }
-            }
-        );
+            });
         view_finalized_ = true;
     }
     if (!results.empty()) {
         SomeIOWorker()->ScheduleFunction(
-            nullptr, [this, results = std::move(results)] {
-                ProcessReadResults(results);
-            }
-        );
+            nullptr, [this, results = std::move(results)] { ProcessReadResults(results); });
     }
     if (!index_data_vec.empty()) {
-        SomeIOWorker()->ScheduleFunction(
-            nullptr, [this, view = finalized_view->view(),
-                      index_data_vec = std::move(index_data_vec)] {
-                for (const IndexDataProto& index_data : index_data_vec) {
-                    SendIndexData(view, index_data);
-                }
+        SomeIOWorker()->ScheduleFunction(nullptr, [this, view = finalized_view->view(),
+                                                   index_data_vec = std::move(index_data_vec)] {
+            for (const IndexDataProto &index_data : index_data_vec) {
+                SendIndexData(view, index_data);
             }
-        );
+        });
     }
 }
 
-#define ONHOLD_IF_FROM_FUTURE_VIEW(MESSAGE_VAR, PAYLOAD_VAR)        \
-    do {                                                            \
-        if (current_view_ == nullptr                                \
-                || (MESSAGE_VAR).view_id > current_view_->id()) {   \
-            future_requests_.OnHoldRequest(                         \
-                (MESSAGE_VAR).view_id,                              \
-                SharedLogRequest(MESSAGE_VAR, PAYLOAD_VAR));        \
-            return;                                                 \
-        }                                                           \
+#define ONHOLD_IF_FROM_FUTURE_VIEW(MESSAGE_VAR, PAYLOAD_VAR)                                       \
+    do {                                                                                           \
+        if (current_view_ == nullptr || (MESSAGE_VAR).view_id > current_view_->id()) {             \
+            future_requests_.OnHoldRequest((MESSAGE_VAR).view_id,                                  \
+                                           SharedLogRequest(MESSAGE_VAR, PAYLOAD_VAR));            \
+            return;                                                                                \
+        }                                                                                          \
     } while (0)
 
-#define IGNORE_IF_FROM_PAST_VIEW(MESSAGE_VAR)                       \
-    do {                                                            \
-        if (current_view_ != nullptr                                \
-                && (MESSAGE_VAR).view_id < current_view_->id()) {   \
-            HLOG_F(WARNING, "Receive outdate request from view {}", \
-                   (MESSAGE_VAR).view_id);                          \
-            return;                                                 \
-        }                                                           \
+#define IGNORE_IF_FROM_PAST_VIEW(MESSAGE_VAR)                                                      \
+    do {                                                                                           \
+        if (current_view_ != nullptr && (MESSAGE_VAR).view_id < current_view_->id()) {             \
+            HLOG_F(WARNING, "Receive outdate request from view {}", (MESSAGE_VAR).view_id);        \
+            return;                                                                                \
+        }                                                                                          \
     } while (0)
 
-#define RETURN_IF_LOGSPACE_FINALIZED(LOGSPACE_PTR)                  \
-    do {                                                            \
-        if ((LOGSPACE_PTR)->finalized()) {                          \
-            uint32_t logspace_id = (LOGSPACE_PTR)->identifier();    \
-            HLOG_F(WARNING, "LogSpace {} is finalized",             \
-                   bits::HexStr0x(logspace_id));                    \
-            return;                                                 \
-        }                                                           \
+#define RETURN_IF_LOGSPACE_FINALIZED(LOGSPACE_PTR)                                                 \
+    do {                                                                                           \
+        if ((LOGSPACE_PTR)->finalized()) {                                                         \
+            uint32_t logspace_id = (LOGSPACE_PTR)->identifier();                                   \
+            HLOG_F(WARNING, "LogSpace {} is finalized", bits::HexStr0x(logspace_id));              \
+            return;                                                                                \
+        }                                                                                          \
     } while (0)
 
-void Storage::HandleReadAtRequest(const SharedLogMessage& request) {
+void Storage::HandleReadAtRequest(const SharedLogMessage &request) {
     DCHECK(SharedLogMessageHelper::GetOpType(request) == SharedLogOpType::READ_AT);
     LockablePtr<LogStorage> storage_ptr;
     {
@@ -150,7 +133,7 @@ void Storage::HandleReadAtRequest(const SharedLogMessage& request) {
     ProcessReadResults(results);
 }
 
-void Storage::HandleReplicateRequest(const SharedLogMessage& message,
+void Storage::HandleReplicateRequest(const SharedLogMessage &message,
                                      std::span<const char> payload) {
     DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::REPLICATE);
     LogMetaData metadata = log_utils::GetMetaDataFromMessage(message);
@@ -173,12 +156,11 @@ void Storage::HandleReplicateRequest(const SharedLogMessage& message,
     }
 }
 
-void Storage::OnRecvNewMetaLogs(const SharedLogMessage& message,
-                                std::span<const char> payload) {
+void Storage::OnRecvNewMetaLogs(const SharedLogMessage &message, std::span<const char> payload) {
     DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::METALOGS);
     MetaLogsProto metalogs_proto = log_utils::MetaLogsFromPayload(payload);
     DCHECK_EQ(metalogs_proto.logspace_id(), message.logspace_id);
-    const View* view = nullptr;
+    const View *view = nullptr;
     LogStorage::ReadResultVec results;
     std::optional<IndexDataProto> index_data;
     {
@@ -190,20 +172,22 @@ void Storage::OnRecvNewMetaLogs(const SharedLogMessage& message,
         {
             auto locked_storage = storage_ptr.Lock();
             RETURN_IF_LOGSPACE_FINALIZED(locked_storage);
-            for (const MetaLogProto& metalog_proto : metalogs_proto.metalogs()) {
+            for (const MetaLogProto &metalog_proto : metalogs_proto.metalogs()) {
                 locked_storage->ProvideMetaLog(metalog_proto);
             }
             locked_storage->PollReadResults(&results);
             index_data = locked_storage->PollIndexData();
         }
     }
+    HVLOG(1) << "recv metalog";
     ProcessReadResults(results);
     if (index_data.has_value()) {
+        HVLOG(1) << "send index data";
         SendIndexData(DCHECK_NOTNULL(view), *index_data);
     }
 }
 
-void Storage::OnRecvLogAuxData(const protocol::SharedLogMessage& message,
+void Storage::OnRecvLogAuxData(const protocol::SharedLogMessage &message,
                                std::span<const char> payload) {
     DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::SET_AUXDATA);
     uint64_t seqnum = bits::JoinTwo32(message.logspace_id, message.seqnum_lowhalf);
@@ -214,9 +198,9 @@ void Storage::OnRecvLogAuxData(const protocol::SharedLogMessage& message,
 #undef IGNORE_IF_FROM_PAST_VIEW
 #undef RETURN_IF_LOGSPACE_FINALIZED
 
-void Storage::ProcessReadResults(const LogStorage::ReadResultVec& results) {
-    for (const LogStorage::ReadResult& result : results) {
-        const SharedLogMessage& request = result.original_request;
+void Storage::ProcessReadResults(const LogStorage::ReadResultVec &results) {
+    for (const LogStorage::ReadResult &result : results) {
+        const SharedLogMessage &request = result.original_request;
         SharedLogMessage response;
         switch (result.status) {
         case LogStorage::ReadResult::kOK:
@@ -244,7 +228,7 @@ void Storage::ProcessReadResults(const LogStorage::ReadResultVec& results) {
     }
 }
 
-void Storage::ProcessReadFromDB(const SharedLogMessage& request) {
+void Storage::ProcessReadFromDB(const SharedLogMessage &request) {
     uint64_t seqnum = bits::JoinTwo32(request.logspace_id, request.seqnum_lowhalf);
     LogEntryProto log_entry;
     if (auto tmp = GetLogEntryFromDB(seqnum); tmp.has_value()) {
@@ -261,22 +245,20 @@ void Storage::ProcessReadFromDB(const SharedLogMessage& request) {
     DCHECK_EQ(response.seqnum_lowhalf, request.seqnum_lowhalf);
     response.user_metalog_progress = request.user_metalog_progress;
     std::span<const char> user_tags_data(
-        reinterpret_cast<const char*>(log_entry.user_tags().data()),
+        reinterpret_cast<const char *>(log_entry.user_tags().data()),
         static_cast<size_t>(log_entry.user_tags().size()) * sizeof(uint64_t));
-    SendEngineLogResult(request, &response, user_tags_data,
-                        STRING_AS_SPAN(log_entry.data()));
+    SendEngineLogResult(request, &response, user_tags_data, STRING_AS_SPAN(log_entry.data()));
 }
 
-void Storage::ProcessRequests(const std::vector<SharedLogRequest>& requests) {
-    for (const SharedLogRequest& request : requests) {
+void Storage::ProcessRequests(const std::vector<SharedLogRequest> &requests) {
+    for (const SharedLogRequest &request : requests) {
         MessageHandler(request.message, STRING_AS_SPAN(request.payload));
     }
 }
 
-void Storage::SendEngineLogResult(const protocol::SharedLogMessage& request,
-                                  protocol::SharedLogMessage* response,
-                                  std::span<const char> tags_data,
-                                  std::span<const char> log_data) {
+void Storage::SendEngineLogResult(const protocol::SharedLogMessage &request,
+                                  protocol::SharedLogMessage *response,
+                                  std::span<const char> tags_data, std::span<const char> log_data) {
     uint64_t seqnum = bits::JoinTwo32(response->logspace_id, response->seqnum_lowhalf);
     std::optional<std::string> cached_aux_data = LogCacheGetAuxData(seqnum);
     std::span<const char> aux_data;
@@ -285,11 +267,11 @@ void Storage::SendEngineLogResult(const protocol::SharedLogMessage& request,
         if (full_size <= MESSAGE_INLINE_DATA_SIZE) {
             aux_data = STRING_AS_SPAN(*cached_aux_data);
         } else {
-            HLOG_F(WARNING, "Inline buffer of message not large enough "
-                            "for auxiliary data of log (seqnum {}): "
-                            "log_size={}, num_tags={} aux_data_size={}",
-                   bits::HexStr0x(seqnum), log_data.size(),
-                   tags_data.size() / sizeof(uint64_t),
+            HLOG_F(WARNING,
+                   "Inline buffer of message not large enough "
+                   "for auxiliary data of log (seqnum {}): "
+                   "log_size={}, num_tags={} aux_data_size={}",
+                   bits::HexStr0x(seqnum), log_data.size(), tags_data.size() / sizeof(uint64_t),
                    cached_aux_data->size());
         }
     }
@@ -301,8 +283,8 @@ void Storage::BackgroundThreadMain() {
     int timerfd = io_utils::CreateTimerFd();
     CHECK(timerfd != -1) << "Failed to create timerfd";
     io_utils::FdUnsetNonblocking(timerfd);
-    absl::Duration interval = absl::Milliseconds(
-        absl::GetFlag(FLAGS_slog_storage_bgthread_interval_ms));
+    absl::Duration interval =
+        absl::Milliseconds(absl::GetFlag(FLAGS_slog_storage_bgthread_interval_ms));
     CHECK(io_utils::SetupTimerFdPeriodic(timerfd, absl::Milliseconds(100), interval))
         << "Failed to setup timerfd with interval " << interval;
     bool running = true;
@@ -328,8 +310,7 @@ void Storage::SendShardProgressIfNeeded() {
         }
         storage_collection_.ForEachActiveLogSpace(
             current_view_,
-            [&progress_to_send] (uint32_t logspace_id,
-                                 LockablePtr<LogStorage> storage_ptr) {
+            [&progress_to_send](uint32_t logspace_id, LockablePtr<LogStorage> storage_ptr) {
                 auto locked_storage = storage_ptr.Lock();
                 if (!locked_storage->frozen() && !locked_storage->finalized()) {
                     auto progress = locked_storage->GrabShardProgressForSending();
@@ -337,10 +318,9 @@ void Storage::SendShardProgressIfNeeded() {
                         progress_to_send.emplace_back(logspace_id, std::move(*progress));
                     }
                 }
-            }
-        );
+            });
     }
-    for (const auto& entry : progress_to_send) {
+    for (const auto &entry : progress_to_send) {
         uint32_t logspace_id = entry.first;
         SharedLogMessage message = SharedLogMessageHelper::NewShardProgressMessage(logspace_id);
         SendSequencerMessage(bits::LowHalf32(logspace_id), &message,
@@ -354,8 +334,7 @@ void Storage::FlushLogEntries() {
     {
         absl::ReaderMutexLock view_lk(&view_mu_);
         storage_collection_.ForEachActiveLogSpace(
-            [&log_entires, &storages] (uint32_t logspace_id,
-                                       LockablePtr<LogStorage> storage_ptr) {
+            [&log_entires, &storages](uint32_t logspace_id, LockablePtr<LogStorage> storage_ptr) {
                 auto locked_storage = storage_ptr.ReaderLock();
                 std::vector<std::shared_ptr<const LogEntry>> tmp;
                 uint64_t new_position;
@@ -363,8 +342,7 @@ void Storage::FlushLogEntries() {
                     storages.emplace_back(storage_ptr, new_position);
                     log_entires.insert(log_entires.end(), tmp.begin(), tmp.end());
                 }
-            }
-        );
+            });
     }
 
     if (log_entires.empty()) {
@@ -376,11 +354,10 @@ void Storage::FlushLogEntries() {
     }
 
     std::vector<uint32_t> finalized_logspaces;
-    for (auto& [storage_ptr, new_position] : storages) {
+    for (auto &[storage_ptr, new_position] : storages) {
         auto locked_storage = storage_ptr.Lock();
         locked_storage->LogEntriesPersisted(new_position);
-        if (locked_storage->finalized()
-                && new_position >= locked_storage->seqnum_position()) {
+        if (locked_storage->finalized() && new_position >= locked_storage->seqnum_position()) {
             finalized_logspaces.push_back(locked_storage->identifier());
         }
     }
@@ -398,5 +375,5 @@ void Storage::FlushLogEntries() {
     }
 }
 
-}  // namespace log
-}  // namespace faas
+} // namespace log
+} // namespace faas

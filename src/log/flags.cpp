@@ -13,6 +13,7 @@ ABSL_FLAG(float, slog_engine_prob_remote_index, 0.0f, "");
 ABSL_FLAG(bool, slog_engine_enable_cache, false, "");
 ABSL_FLAG(int, slog_engine_cache_cap_mb, 1024, "");
 ABSL_FLAG(bool, slog_engine_propagate_auxdata, false, "");
+ABSL_FLAG(bool, slog_engine_cache_prefetch, false, "");
 
 ABSL_FLAG(int, slog_storage_cache_cap_mb, 1024, "");
 ABSL_FLAG(std::string, slog_storage_backend, "rocksdb",

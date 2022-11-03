@@ -97,7 +97,7 @@ void IOWorker::RegisterConnection(ConnectionBase* connection) {
             connections_by_type_[conn_type].reset(new utils::RoundRobinSet<int>());
         }
         connections_by_type_[conn_type]->Add(connection->id());
-        HLOG_F(INFO, "New connection of type {0}, total of type {0} is {1}",
+        HLOG_F(INFO, "New connection of type {0:#x}, total of type {0:#x} is {1}",
                conn_type, connections_by_type_[conn_type]->size());
     }
     if (state_.load(std::memory_order_acquire) == kStopping) {
