@@ -7,11 +7,12 @@ __END_THIRD_PARTY_HEADERS
 namespace faas {
 namespace log {
 
-LRUCache::LRUCache(int mem_cap_mb, bool prefetch) : prefetch(prefetch) {
+LRUCache::LRUCache(int mem_cap_mb, bool prefetch) : prefetch_(prefetch) {
     int64_t cap_mem_size = -1;
     if (mem_cap_mb > 0) {
         cap_mem_size = int64_t{mem_cap_mb} << 20;
     }
+    VLOG(1) << fmt::format("build cache with prefetch={}", prefetch_);
     dbm_.reset(new tkrzw::CacheDBM(/* cap_rec_num= */ -1, cap_mem_size));
 }
 
@@ -74,8 +75,8 @@ std::optional<LogEntry> LRUCache::Get(uint64_t seqnum) {
         DecodeLogEntry(std::move(data), &log_entry);
         DCHECK_EQ(seqnum, log_entry.metadata.seqnum);
         return log_entry;
-    } else if (prefetch) {
-        VLOG_F(1, "return fake cache at seqnum({})", seqnum);
+    } else if (prefetch_) {
+        VLOG_F(1, "return fake cache at seqnum({:#x})", seqnum);
         LogEntry log_entry;
         memset(static_cast<void *>(&log_entry), 0, sizeof(LogEntry));
         log_entry.metadata.seqnum = seqnum;

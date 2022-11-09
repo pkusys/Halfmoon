@@ -402,8 +402,11 @@ void Engine::ProcessAppendResults(const LogProducer::AppendResultVec &results) {
             LogCachePut(log_metadata, VECTOR_AS_SPAN(op->user_tags), op->data.to_span());
             Message response = MessageHelper::NewSharedLogOpSucceeded(
                 SharedLogResultType::APPEND_OK, result.seqnum);
+            HVLOG(1) << fmt::format("append succeed localid={:#x} seqnum={:#x}", result.localid,
+                                    result.seqnum);
             FinishLocalOpWithResponse(op, &response, result.metalog_progress);
         } else {
+            HVLOG(1) << fmt::format("append failed localid={:#x}", result.localid);
             FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
         }
     }

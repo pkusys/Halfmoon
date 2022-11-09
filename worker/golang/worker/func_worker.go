@@ -8,11 +8,11 @@ import (
 	"log"
 	"net"
 	"os"
-	"time"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	common "cs.utexas.edu/zjia/faas/common"
 	config "cs.utexas.edu/zjia/faas/config"
@@ -602,7 +602,8 @@ func buildLogEntryFromReadResponse(response []byte) *types.LogEntry {
 	responseData := protocol.GetInlineDataFromMessage(response)
 	logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
 	if logDataSize <= 0 {
-		log.Fatalf("[FATAL] Size of inline data too smaler: size=%d, num_tags=%d, aux_data=%d", len(responseData), numTags, auxDataSize)
+		// log.Fatalf("[FATAL] Size of inline data too smaler: size=%d, num_tags=%d, aux_data=%d", len(responseData), numTags, auxDataSize)
+		log.Printf("[WARN] Size of inline data too small (fake cache?): size=%d, num_tags=%d, aux_data=%d\n", len(responseData), numTags, auxDataSize)
 	}
 	tags := make([]uint64, numTags)
 	for i := 0; i < numTags; i++ {

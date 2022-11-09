@@ -22,7 +22,7 @@ public:
 
 private:
     std::unique_ptr<tkrzw::CacheDBM> dbm_;
-    bool prefetch;
+    bool prefetch_;
 
     DISALLOW_COPY_AND_ASSIGN(LRUCache);
 };

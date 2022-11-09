@@ -202,6 +202,9 @@ void EngineBase::OnRecvSharedLogMessage(int conn_type, uint16_t src_node_id,
            op_type == SharedLogOpType::RESPONSE)
         << fmt::format("Invalid combination: conn_type={:#x}, op_type={:#x}", conn_type,
                        message.op_type);
+    auto msg = fmt::format("recv shared log msg conn_type={:#x}, op_type={:#x}", conn_type,
+                           message.op_type);
+    HVLOG(1) << msg;
     MessageHandler(message, payload);
 }
 
@@ -262,24 +265,24 @@ void EngineBase::LogCachePut(const LogMetaData &log_metadata, std::span<const ui
         return;
     }
     // HVLOG_F(1, "Store cache for log entry (seqnum {})", bits::HexStr0x(log_metadata.seqnum));
-    HVLOG_F(1, "Store cache for log entry (seqnum {})", log_metadata.seqnum);
+    HVLOG_F(1, "Store cache for log entry (seqnum {:#x})", log_metadata.seqnum);
     log_cache_->Put(log_metadata, user_tags, log_data);
 }
 
 std::optional<LogEntry> EngineBase::LogCacheGet(uint64_t seqnum) {
-    HVLOG_F(1, "try get cache at seqnum({})", seqnum);
+    HVLOG_F(1, "try get cache at seqnum({:#x})", seqnum);
     return log_cache_.has_value() ? log_cache_->Get(seqnum) : std::nullopt;
 }
 
 void EngineBase::LogCachePutAuxData(uint64_t seqnum, std::span<const char> data) {
     if (log_cache_.has_value()) {
-        HVLOG_F(1, "cache put aux at seqnum({})", seqnum);
+        HVLOG_F(1, "cache put aux at seqnum({:#x})", seqnum);
         log_cache_->PutAuxData(seqnum, data);
     }
 }
 
 std::optional<std::string> EngineBase::LogCacheGetAuxData(uint64_t seqnum) {
-    HVLOG_F(1, "try get cache aux data at seqnum({})", seqnum);
+    HVLOG_F(1, "try get cache aux data at seqnum({:#x})", seqnum);
     return log_cache_.has_value() ? log_cache_->GetAuxData(seqnum) : std::nullopt;
 }
 

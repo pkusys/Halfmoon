@@ -1,28 +1,24 @@
 #include "launcher/func_process.h"
 
 #include "common/time.h"
-#include "utils/fs.h"
 #include "ipc/base.h"
 #include "launcher/launcher.h"
+#include "utils/fs.h"
 
-ABSL_FLAG(bool, hostname_in_output_fname, false, "");
+ABSL_FLAG(bool, hostname_in_output_fname, true, "");
 
 namespace faas {
 namespace launcher {
 
-FuncProcess::FuncProcess(Launcher* launcher, int id, int initial_client_id)
-    : state_(kCreated), launcher_(launcher), id_(id),
-      initial_client_id_(initial_client_id),
-      log_header_(fmt::format("FuncProcess[{}]: ", id)),
-      subprocess_(launcher->fprocess()) {
+FuncProcess::FuncProcess(Launcher *launcher, int id, int initial_client_id)
+    : state_(kCreated), launcher_(launcher), id_(id), initial_client_id_(initial_client_id),
+      log_header_(fmt::format("FuncProcess[{}]: ", id)), subprocess_(launcher->fprocess()) {
     message_pipe_fd_ = subprocess_.CreateReadablePipe();
 }
 
-FuncProcess::~FuncProcess() {
-    DCHECK(state_ == kCreated || state_ == kClosed);
-}
+FuncProcess::~FuncProcess() { DCHECK(state_ == kCreated || state_ == kClosed); }
 
-bool FuncProcess::Start(uv_loop_t* uv_loop, utils::BufferPool* read_buffer_pool) {
+bool FuncProcess::Start(uv_loop_t *uv_loop, utils::BufferPool *read_buffer_pool) {
     DCHECK(state_ == kCreated);
     uv_loop_ = uv_loop;
     read_buffer_pool_ = read_buffer_pool;
@@ -52,6 +48,7 @@ bool FuncProcess::Start(uv_loop_t* uv_loop, utils::BufferPool* read_buffer_pool)
         } else {
             fname_prefix = fmt::format("{}_worker_{}", launcher_->func_name(), id_);
         }
+        fname_prefix = fmt::format("{}.{}", fname_prefix, GetMonotonicMicroTimestamp());
         subprocess_.SetStandardFile(
             uv::Subprocess::kStdout,
             fs_utils::JoinPath(launcher_->fprocess_output_dir(), fname_prefix + ".stdout"));
@@ -71,33 +68,27 @@ bool FuncProcess::Start(uv_loop_t* uv_loop, utils::BufferPool* read_buffer_pool)
     std::string_view func_config_json = launcher_->func_config_json();
     initial_payload_size_ = gsl::narrow_cast<uint32_t>(func_config_json.size());
     uv_buf_t bufs[2];
-    bufs[0] = {
-        .base = reinterpret_cast<char*>(&initial_payload_size_),
-        .len = sizeof(uint32_t)
-    };
-    bufs[1] = {
-        .base = const_cast<char*>(func_config_json.data()),
-        .len = func_config_json.size()
-    };
-    uv_write_t* write_req = launcher_->NewWriteRequest();
+    bufs[0] = {.base = reinterpret_cast<char *>(&initial_payload_size_), .len = sizeof(uint32_t)};
+    bufs[1] = {.base = const_cast<char *>(func_config_json.data()), .len = func_config_json.size()};
+    uv_write_t *write_req = launcher_->NewWriteRequest();
     write_req->data = nullptr;
-    UV_DCHECK_OK(uv_write(write_req, UV_AS_STREAM(message_pipe_),
-                          bufs, 2, &FuncProcess::SendMessageCallback));
+    UV_DCHECK_OK(uv_write(write_req, UV_AS_STREAM(message_pipe_), bufs, 2,
+                          &FuncProcess::SendMessageCallback));
     state_ = kRunning;
     return true;
 }
 
-void FuncProcess::SendMessage(const protocol::Message& message) {
+void FuncProcess::SendMessage(const protocol::Message &message) {
     DCHECK_IN_EVENT_LOOP_THREAD(uv_loop_);
     uv_buf_t buf;
     launcher_->NewWriteBuffer(&buf);
     DCHECK_LE(sizeof(protocol::Message), buf.len);
     memcpy(buf.base, &message, sizeof(protocol::Message));
     buf.len = sizeof(protocol::Message);
-    uv_write_t* write_req = launcher_->NewWriteRequest();
+    uv_write_t *write_req = launcher_->NewWriteRequest();
     write_req->data = buf.base;
-    UV_DCHECK_OK(uv_write(write_req, UV_AS_STREAM(message_pipe_),
-                          &buf, 1, &FuncProcess::SendMessageCallback));
+    UV_DCHECK_OK(uv_write(write_req, UV_AS_STREAM(message_pipe_), &buf, 1,
+                          &FuncProcess::SendMessageCallback));
 }
 
 void FuncProcess::ScheduleClose() {
@@ -128,7 +119,7 @@ void FuncProcess::OnSubprocessExit(int exit_status, std::span<const char> stdout
 UV_WRITE_CB_FOR_CLASS(FuncProcess, SendMessage) {
     auto reclaim_resource = gsl::finally([this, req] {
         if (req->data != nullptr) {
-            launcher_->ReturnWriteBuffer(reinterpret_cast<char*>(req->data));
+            launcher_->ReturnWriteBuffer(reinterpret_cast<char *>(req->data));
         }
         launcher_->ReturnWriteRequest(req);
     });
@@ -139,5 +130,5 @@ UV_WRITE_CB_FOR_CLASS(FuncProcess, SendMessage) {
     }
 }
 
-}  // namespace launcher
-}  // namespace faas
+} // namespace launcher
+} // namespace faas
