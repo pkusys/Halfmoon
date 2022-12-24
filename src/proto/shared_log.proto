@@ -122,3 +122,156 @@ message IndexDataProto {
     repeated uint32 user_tag_sizes = 5;
     repeated uint64 user_tags      = 6;
 }
+
+
+// struct TxnCommonHeader {
+//     uint16_t record_type;
+//     uint16_t txn_id;
+//     // TODO: move these fields from sharedlogmsg to here
+//     // uint32_t logspace_id;
+//     // uint32_t seqnum_lowhalf;
+// };
+
+// struct TxnCommitHeader {
+//     uint64_t txn_id; // aka localid in localappend; high half engine id
+    
+// }
+
+message TxnCommitProto {
+    uint64 txn_id = 1;
+    uint64 start_seqnum = 2; // reordered to boundaries of metalogs
+    repeated uint64 read_set = 3;
+    repeated uint64 write_set = 4;
+}
+
+message TxnLockProto {
+    enum LockOpType {
+        INVALID = 0;
+        READ_LOCK = 1;
+        WRITE_LOCK = 2;
+        READ_UNLOCK = 3;
+        COMMIT = 4;
+        // WRITE_UNLOCK = 6;
+    }
+    LockOpType op_type = 1;
+    uint64 txn_id = 2;
+    uint64 key = 3; // not for commit 
+}
+
+message TxnCommitLocalBatchProto {
+    uint64 local_batch_id = 1; // high half sequencer id; low half local id
+    repeated TxnCommitProto commit_order = 2;
+    repeated uint64 abort_txn_ids = 3;
+}
+
+message TxnLockLocalBatchProto {
+    uint64 local_batch_id = 1; // high half sequencer id; low half local id
+    message LockOp {
+        uint64 txn_id = 1;
+        uint64 key = 2; // not for commit 
+    }
+    repeated uint64 commit_txn_ids = 2; // order is irrelevant
+    // repeated uint64 abort_txn_ids = 3;
+    repeated LockOp read_unlocks = 5;
+    repeated LockOp read_locks = 3;
+    repeated LockOp write_locks = 4;
+}
+
+// // engine to sequencer
+// message CCEntryProto {
+//     // CC messages follow a different path than append; see log producer
+//     // CC: engine->storage->engine->sequencer
+//     // Append: engine->storage->sequencer
+//     // theses fields will not be serialized onto the wire unless explicitly set
+//     uint64 txn_localid = 1; // view_id + engine_id + localid
+//     // uint32 engine_id = 1; // view_id+engine_id
+//     // // uint32 txn_id = 2;
+//     // uint32 local_id = 3;
+//     enum EntryType {
+//         INVALID = 0;
+//         // TXN_START = 1;
+//         TXN_COMMIT = 2;
+//         READ_LOCK = 3;
+//         WRITE_LOCK = 4;
+//         READ_UNLOCK = 5;
+//         WRITE_UNLOCK = 6;
+//     }
+//     EntryType type = 2;
+
+//     message TxnCommit {
+//         uint64 txn_id = 1;
+//         uint64 start_seqnum = 2; // reordered to boundaries of metalogs
+//         repeated uint64 read_set = 3;
+//         repeated uint64 write_set = 4;
+//     }
+//     TxnCommit commit_msg = 3;
+
+//     message Lock {
+//         uint64 txn_id = 1;
+//         uint64 key = 2;
+//     }
+//     Lock lock_msg = 4;
+
+//     // TODO: add atomic
+// }
+
+// // sequencer to sequencer
+// message CCLocalBatchProto {
+//     uint64 local_batch_id = 1; // high half sequencer id; low half local id
+//     repeated CCEntryProto local_order = 2;
+//     // message ConflictEntryProto {
+//     //     uint64 key = 1;
+//     //     repeated uint32 read_txn_offsets = 2;
+//     //     repeated uint32 write_txn_offsets = 3;
+//     // }
+//     // repeated ConflictEntryProto conflict_entries = 2;
+//     // repeated uint64 txn_ids = 3;
+// }
+
+// // sequencer to metasequencer
+// message SLogCCMetaProgress {
+//     uint32 start_metalog_seqnum = 1;
+//     repeated uint32 shard_starts = 2;
+//     repeated uint32 shard_deltas = 3;
+// }
+
+// sequencer to engine
+message CCGlobalBatchProto {
+    // in cc global batch, seqnum is replaced by global batch id
+    // which is the same as metalog_seqnum
+    // these two are both increased by the controller(metasequencer)
+    // to guarantee external consistency, index must apply in order
+    uint64 global_batch_id = 1;
+    uint64 start_seqnum = 2;
+    uint64 end_seqnum = 3;
+
+    message Index {
+        uint64 key = 1;
+        repeated uint64 txn_ids = 2;
+        repeated uint32 offsets = 3;
+    }
+    repeated Index batch_index = 4;
+    
+    // enum CCResult {
+    //     INVALID = 0;
+    //     SUCCESS = 1;
+    //     FAILED = 2; // for try_lock
+    //     ABORT = 3;
+    // }
+    // only return txn and results of the target engine
+    // the index below is global though
+    repeated uint64 committed_txn_ids = 5;
+    repeated uint32 committed_offsets = 6;
+    // repeated CCResult results = 7;
+    repeated uint64 aborted_txn_ids = 7;
+    
+    // todo: remove this field, txn_start should be handled by the glocal cut of meta-sequencer
+    uint64 latest_txn_start = 8;
+}
+
+// NOTE: special handling of txn_start; each engine is mapped to a specific sequencer
+// sequencer maintain max localid of txn_start records from each engine
+// send a single shared log message with uint32 max_id as payload (or use any unused field in shared log message)
+// sending a txn_start is simply adding a new op_type in shared log message (and setting the localid)
+
+

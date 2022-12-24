@@ -2,8 +2,7 @@
 
 #include "base/common.h"
 
-namespace faas {
-namespace utils {
+namespace faas { namespace utils {
 
 // AppendableBuffer is NOT thread-safe
 class AppendableBuffer {
@@ -12,7 +11,9 @@ public:
     static constexpr size_t kDefaultInitialSize = kInlineBufferSize;
 
     explicit AppendableBuffer(size_t initial_size = kDefaultInitialSize)
-        : buf_size_(initial_size), pos_(0) {
+        : buf_size_(initial_size),
+          pos_(0)
+    {
         if (initial_size <= kInlineBufferSize) {
             buf_ = inline_buf_;
             buf_size_ = kInlineBufferSize;
@@ -21,13 +22,15 @@ public:
         }
     }
 
-    ~AppendableBuffer() {
+    ~AppendableBuffer()
+    {
         if (buf_ != inline_buf_) {
             delete[] buf_;
         }
     }
 
-    void AppendData(const char* data, size_t length) {
+    void AppendData(const char* data, size_t length)
+    {
         if (length == 0) {
             return;
         }
@@ -48,12 +51,14 @@ public:
         pos_ += length;
     }
 
-    void AppendData(std::span<const char> data) {
+    void AppendData(std::span<const char> data)
+    {
         AppendData(data.data(), data.size());
     }
 
     void Reset() { pos_ = 0; }
-    void ConsumeFront(size_t size) {
+    void ConsumeFront(size_t size)
+    {
         DCHECK_LE(size, pos_);
         if (size < pos_) {
             memmove(buf_, buf_ + size, pos_ - size);
@@ -61,12 +66,14 @@ public:
         pos_ -= size;
     }
 
-    void ResetWithData(std::span<const char> data) {
+    void ResetWithData(std::span<const char> data)
+    {
         Reset();
         AppendData(data);
     }
 
-    std::span<const char> to_span() const {
+    std::span<const char> to_span() const
+    {
         return std::span<const char>(buf_, pos_);
     }
 
@@ -76,7 +83,8 @@ public:
     bool empty() const { return pos_ == 0; }
     size_t buffer_size() const { return buf_size_; }
 
-    void Swap(AppendableBuffer& other) {
+    void Swap(AppendableBuffer& other)
+    {
         // In all cases, buffer size and position can be directly swapped
         std::swap(pos_, other.pos_);
         std::swap(buf_size_, other.buf_size_);
@@ -102,7 +110,8 @@ public:
                 memcpy(other.inline_buf_, inline_buf_, kInlineBufferSize);
                 other.buf_ = other.inline_buf_;
             } else {
-                // The other also uses inline buffer, just swap contents of two inline buffers
+                // The other also uses inline buffer, just swap contents of two
+                // inline buffers
                 char tmp_buffer[kInlineBufferSize];
                 memcpy(tmp_buffer, inline_buf_, kInlineBufferSize);
                 memcpy(inline_buf_, other.inline_buf_, kInlineBufferSize);
@@ -120,10 +129,13 @@ private:
     DISALLOW_COPY_AND_ASSIGN(AppendableBuffer);
 };
 
-template<class T>
-void ReadMessages(AppendableBuffer* buffer,
-                  const char* new_data, size_t new_data_length,
-                  std::function<void(T*)> callback) {
+template <class T>
+void
+ReadMessages(AppendableBuffer* buffer,
+             const char* new_data,
+             size_t new_data_length,
+             std::function<void(T*)> callback)
+{
     DCHECK_LT(buffer->length(), sizeof(T));
     while (new_data_length + buffer->length() >= sizeof(T)) {
         size_t copy_size = sizeof(T) - buffer->length();
@@ -140,5 +152,4 @@ void ReadMessages(AppendableBuffer* buffer,
     }
 }
 
-}  // namespace utils
-}  // namespace faas
+}} // namespace faas::utils

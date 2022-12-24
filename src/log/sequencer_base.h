@@ -7,29 +7,40 @@
 #include "server/ingress_connection.h"
 #include "server/egress_hub.h"
 
-namespace faas {
-namespace log {
+namespace faas { namespace log {
 
-class SequencerBase : public server::ServerBase {
+class SequencerBase: public server::ServerBase {
 public:
     explicit SequencerBase(uint16_t node_id);
     virtual ~SequencerBase();
 
-protected:
+    virtual void OnRecvReorderRequest(const protocol::SharedLogMessage& message,
+                                      std::span<const char> payload) = 0;
+    virtual void OnRecvTxnStartRequest(
+        const protocol::SharedLogMessage& message) = 0;
+
     uint16_t my_node_id() const { return node_id_; }
 
+    bool SendSharedLogMessage(protocol::ConnType conn_type,
+                              uint16_t dst_node_id,
+                              const protocol::SharedLogMessage& message,
+                              std::span<const char> payload);
+
+protected:
     virtual void OnViewCreated(const View* view) = 0;
     virtual void OnViewFrozen(const View* view) = 0;
     virtual void OnViewFinalized(const FinalizedView* finalized_view) = 0;
 
     virtual void HandleTrimRequest(const protocol::SharedLogMessage& message) = 0;
-    virtual void OnRecvMetaLogProgress(const protocol::SharedLogMessage& message) = 0;
+    virtual void OnRecvMetaLogProgress(
+        const protocol::SharedLogMessage& message) = 0;
     virtual void OnRecvShardProgress(const protocol::SharedLogMessage& message,
                                      std::span<const char> payload) = 0;
     virtual void OnRecvNewMetaLogs(const protocol::SharedLogMessage& message,
                                    std::span<const char> payload) = 0;
 
     virtual void MarkNextCutIfDoable() = 0;
+    virtual void GrantTxnStartIds() = 0;
 
     void MessageHandler(const protocol::SharedLogMessage& message,
                         std::span<const char> payload);
@@ -65,12 +76,10 @@ private:
     void OnRemoteMessageConn(const protocol::HandshakeMessage& handshake,
                              int sockfd) override;
 
-    void OnRecvSharedLogMessage(int conn_type, uint16_t src_node_id,
+    void OnRecvSharedLogMessage(int conn_type,
+                                uint16_t src_node_id,
                                 const protocol::SharedLogMessage& message,
                                 std::span<const char> payload);
-    bool SendSharedLogMessage(protocol::ConnType conn_type, uint16_t dst_node_id,
-                              const protocol::SharedLogMessage& message,
-                              std::span<const char> payload);
 
     server::EgressHub* CreateEgressHub(protocol::ConnType conn_type,
                                        uint16_t dst_node_id,
@@ -79,5 +88,4 @@ private:
     DISALLOW_COPY_AND_ASSIGN(SequencerBase);
 };
 
-}  // namespace log
-}  // namespace faas
+}} // namespace faas::log

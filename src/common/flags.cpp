@@ -1,4 +1,5 @@
 #include "common/flags.h"
+#include <cstdint>
 
 ABSL_FLAG(std::string, listen_addr, "0.0.0.0",
           "Address to listen for external TCP connections");

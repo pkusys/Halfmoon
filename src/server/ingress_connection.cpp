@@ -4,23 +4,34 @@
 #include "server/constants.h"
 #include "utils/socket.h"
 
-namespace faas {
-namespace server {
+namespace faas { namespace server {
 
 IngressConnection::IngressConnection(int type, int sockfd, size_t msghdr_size)
-    : ConnectionBase(type), io_worker_(nullptr), state_(kCreated), sockfd_(sockfd),
-      msghdr_size_(msghdr_size), buf_group_(kDefaultIngressBufGroup), buf_size_(kDefaultBufSize),
-      log_header_(GetLogHeader(type, sockfd)) {}
+    : ConnectionBase(type),
+      io_worker_(nullptr),
+      state_(kCreated),
+      sockfd_(sockfd),
+      msghdr_size_(msghdr_size),
+      buf_group_(kDefaultIngressBufGroup),
+      buf_size_(kDefaultBufSize),
+      log_header_(GetLogHeader(type, sockfd))
+{}
 
-IngressConnection::~IngressConnection() { DCHECK(state_ == kCreated || state_ == kClosed); }
+IngressConnection::~IngressConnection()
+{
+    DCHECK(state_ == kCreated || state_ == kClosed);
+}
 
-void IngressConnection::Start(IOWorker *io_worker) {
+void
+IngressConnection::Start(IOWorker* io_worker)
+{
     std::string_view workerName;
     if (IOWorker::current() != nullptr) {
         workerName = IOWorker::current()->worker_name();
     }
     HVLOG(1) << fmt::format("starting ingress conn at worker {}(current {})",
-                            io_worker->worker_name(), workerName);
+                            io_worker->worker_name(),
+                            workerName);
     DCHECK(state_ == kCreated);
     DCHECK(io_worker->WithinMyEventLoopThread());
     io_worker_ = io_worker;
@@ -33,11 +44,15 @@ void IngressConnection::Start(IOWorker *io_worker) {
     }
     URING_DCHECK_OK(current_io_uring()->RegisterFd(sockfd_));
     URING_DCHECK_OK(current_io_uring()->StartRecv(
-        sockfd_, buf_group_, absl::bind_front(&IngressConnection::OnRecvData, this)));
+        sockfd_,
+        buf_group_,
+        absl::bind_front(&IngressConnection::OnRecvData, this)));
     state_ = kRunning;
 }
 
-void IngressConnection::ScheduleClose() {
+void
+IngressConnection::ScheduleClose()
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (state_ == kClosing) {
         HLOG(WARNING) << "Already scheduled for closing";
@@ -52,13 +67,21 @@ void IngressConnection::ScheduleClose() {
     state_ = kClosing;
 }
 
-void IngressConnection::SetMessageFullSizeCallback(MessageFullSizeCallback cb) {
+void
+IngressConnection::SetMessageFullSizeCallback(MessageFullSizeCallback cb)
+{
     message_full_size_cb_ = cb;
 }
 
-void IngressConnection::SetNewMessageCallback(NewMessageCallback cb) { new_message_cb_ = cb; }
+void
+IngressConnection::SetNewMessageCallback(NewMessageCallback cb)
+{
+    new_message_cb_ = cb;
+}
 
-void IngressConnection::ProcessMessages() {
+void
+IngressConnection::ProcessMessages()
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     while (read_buffer_.length() >= msghdr_size_) {
         std::span<const char> header(read_buffer_.data(), msghdr_size_);
@@ -73,7 +96,9 @@ void IngressConnection::ProcessMessages() {
     }
 }
 
-bool IngressConnection::OnRecvData(int status, std::span<const char> data) {
+bool
+IngressConnection::OnRecvData(int status, std::span<const char> data)
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (status != 0) {
         HPLOG(ERROR) << "Read error, will close this connection";
@@ -90,7 +115,9 @@ bool IngressConnection::OnRecvData(int status, std::span<const char> data) {
     }
 }
 
-std::string IngressConnection::GetLogHeader(int type, int sockfd) {
+std::string
+IngressConnection::GetLogHeader(int type, int sockfd)
+{
     int masked_type = type & kConnectionTypeMask;
     switch (masked_type) {
     case kGatewayIngressTypeId:
@@ -106,19 +133,25 @@ std::string IngressConnection::GetLogHeader(int type, int sockfd) {
     }
 }
 
-size_t IngressConnection::GatewayMessageFullSizeCallback(std::span<const char> header) {
+size_t
+IngressConnection::GatewayMessageFullSizeCallback(std::span<const char> header)
+{
     using protocol::GatewayMessage;
     DCHECK_EQ(header.size(), sizeof(GatewayMessage));
-    const GatewayMessage *message = reinterpret_cast<const GatewayMessage *>(header.data());
+    const GatewayMessage* message =
+        reinterpret_cast<const GatewayMessage*>(header.data());
     return sizeof(GatewayMessage) + message->payload_size;
 }
 
-IngressConnection::NewMessageCallback IngressConnection::BuildNewGatewayMessageCallback(
-    std::function<void(const protocol::GatewayMessage &, std::span<const char>)> cb) {
+IngressConnection::NewMessageCallback
+IngressConnection::BuildNewGatewayMessageCallback(
+    std::function<void(const protocol::GatewayMessage&, std::span<const char>)> cb)
+{
     using protocol::GatewayMessage;
     return [cb](std::span<const char> data) {
         DCHECK_GE(data.size(), sizeof(GatewayMessage));
-        const GatewayMessage *message = reinterpret_cast<const GatewayMessage *>(data.data());
+        const GatewayMessage* message =
+            reinterpret_cast<const GatewayMessage*>(data.data());
         std::span<const char> payload;
         if (data.size() > sizeof(GatewayMessage)) {
             payload = data.subspan(sizeof(GatewayMessage));
@@ -127,19 +160,25 @@ IngressConnection::NewMessageCallback IngressConnection::BuildNewGatewayMessageC
     };
 }
 
-size_t IngressConnection::SharedLogMessageFullSizeCallback(std::span<const char> header) {
+size_t
+IngressConnection::SharedLogMessageFullSizeCallback(std::span<const char> header)
+{
     using protocol::SharedLogMessage;
     DCHECK_EQ(header.size(), sizeof(SharedLogMessage));
-    const SharedLogMessage *message = reinterpret_cast<const SharedLogMessage *>(header.data());
+    const SharedLogMessage* message =
+        reinterpret_cast<const SharedLogMessage*>(header.data());
     return sizeof(SharedLogMessage) + message->payload_size;
 }
 
-IngressConnection::NewMessageCallback IngressConnection::BuildNewSharedLogMessageCallback(
-    std::function<void(const protocol::SharedLogMessage &, std::span<const char>)> cb) {
+IngressConnection::NewMessageCallback
+IngressConnection::BuildNewSharedLogMessageCallback(
+    std::function<void(const protocol::SharedLogMessage&, std::span<const char>)> cb)
+{
     using protocol::SharedLogMessage;
     return [cb](std::span<const char> data) {
         DCHECK_GE(data.size(), sizeof(SharedLogMessage));
-        const SharedLogMessage *message = reinterpret_cast<const SharedLogMessage *>(data.data());
+        const SharedLogMessage* message =
+            reinterpret_cast<const SharedLogMessage*>(data.data());
         std::span<const char> payload;
         if (data.size() > sizeof(SharedLogMessage)) {
             payload = data.subspan(sizeof(SharedLogMessage));
@@ -148,5 +187,4 @@ IngressConnection::NewMessageCallback IngressConnection::BuildNewSharedLogMessag
     };
 }
 
-} // namespace server
-} // namespace faas
+}} // namespace faas::server

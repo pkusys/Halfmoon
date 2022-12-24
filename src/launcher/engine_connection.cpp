@@ -7,28 +7,37 @@
 
 #define log_header_ "EngineConnection: "
 
-namespace faas {
-namespace launcher {
+namespace faas { namespace launcher {
 
 using protocol::Message;
 
 EngineConnection::EngineConnection(Launcher* launcher)
-    : launcher_(launcher), state_(kCreated), uv_loop_(nullptr), engine_conn_(nullptr) {}
+    : launcher_(launcher),
+      state_(kCreated),
+      uv_loop_(nullptr),
+      engine_conn_(nullptr)
+{}
 
-EngineConnection::~EngineConnection() {
+EngineConnection::~EngineConnection()
+{
     DCHECK(state_ == kCreated || state_ == kClosed);
 }
 
-void EngineConnection::Start(uv_loop_t* uv_loop, int engine_tcp_port,
-                             const Message& handshake_message) {
+void
+EngineConnection::Start(uv_loop_t* uv_loop,
+                        int engine_tcp_port,
+                        const Message& handshake_message)
+{
     DCHECK(state_ == kCreated);
     handshake_message_ = handshake_message;
     uv_loop_ = uv_loop;
     if (engine_tcp_port == -1) {
-        uv_pipe_t* pipe_handle = reinterpret_cast<uv_pipe_t*>(malloc(sizeof(uv_pipe_t)));
+        uv_pipe_t* pipe_handle =
+            reinterpret_cast<uv_pipe_t*>(malloc(sizeof(uv_pipe_t)));
         UV_DCHECK_OK(uv_pipe_init(uv_loop, pipe_handle, 0));
         pipe_handle->data = this;
-        uv_pipe_connect(&connect_req_, pipe_handle,
+        uv_pipe_connect(&connect_req_,
+                        pipe_handle,
                         std::string(ipc::GetEngineUnixSocketPath()).c_str(),
                         &EngineConnection::ConnectCallback);
         engine_conn_ = UV_AS_STREAM(pipe_handle);
@@ -37,19 +46,25 @@ void EngineConnection::Start(uv_loop_t* uv_loop, int engine_tcp_port,
         UV_DCHECK_OK(uv_tcp_init(uv_loop, tcp_handle));
         tcp_handle->data = this;
         struct sockaddr_in addr;
-        std::string addr_str(fmt::format("{}:{}",
-            utils::GetEnvVariable("FAAS_ENGINE_HOST", "127.0.0.1"), engine_tcp_port));
+        std::string addr_str(
+            fmt::format("{}:{}",
+                        utils::GetEnvVariable("FAAS_ENGINE_HOST", "127.0.0.1"),
+                        engine_tcp_port));
         if (!utils::ResolveTcpAddr(&addr, addr_str)) {
             HLOG(FATAL) << "Failed to resolve socket address: " << addr_str;
         }
-        uv_tcp_connect(&connect_req_, tcp_handle, (const struct sockaddr *)&addr,
+        uv_tcp_connect(&connect_req_,
+                       tcp_handle,
+                       (const struct sockaddr*)&addr,
                        &EngineConnection::ConnectCallback);
         engine_conn_ = UV_AS_STREAM(tcp_handle);
     }
     state_ = kHandshake;
 }
 
-void EngineConnection::ScheduleClose() {
+void
+EngineConnection::ScheduleClose()
+{
     DCHECK_IN_EVENT_LOOP_THREAD(uv_loop_);
     if (state_ == kHandshake || state_ == kRunning) {
         uv_close(UV_AS_HANDLE(engine_conn_), &EngineConnection::CloseCallback);
@@ -57,7 +72,9 @@ void EngineConnection::ScheduleClose() {
     }
 }
 
-void EngineConnection::RecvHandshakeResponse() {
+void
+EngineConnection::RecvHandshakeResponse()
+{
     UV_DCHECK_OK(uv_read_stop(engine_conn_));
     Message* response = reinterpret_cast<Message*>(message_buffer_.data());
     DCHECK_GE(response->payload_size, 0);
@@ -72,7 +89,9 @@ void EngineConnection::RecvHandshakeResponse() {
     }
 }
 
-void EngineConnection::WriteMessage(const Message& message) {
+void
+EngineConnection::WriteMessage(const Message& message)
+{
     DCHECK_IN_EVENT_LOOP_THREAD(uv_loop_);
     uv_buf_t buf;
     launcher_->NewWriteBuffer(&buf);
@@ -81,11 +100,15 @@ void EngineConnection::WriteMessage(const Message& message) {
     buf.len = sizeof(Message);
     uv_write_t* write_req = launcher_->NewWriteRequest();
     write_req->data = buf.base;
-    UV_DCHECK_OK(uv_write(write_req, engine_conn_,
-                          &buf, 1, &EngineConnection::WriteMessageCallback));
+    UV_DCHECK_OK(uv_write(write_req,
+                          engine_conn_,
+                          &buf,
+                          1,
+                          &EngineConnection::WriteMessageCallback));
 }
 
-UV_CONNECT_CB_FOR_CLASS(EngineConnection, Connect) {
+UV_CONNECT_CB_FOR_CLASS(EngineConnection, Connect)
+{
     if (status != 0) {
         HLOG(WARNING) << "Failed to connect to engine, will close the connection: "
                       << uv_strerror(status);
@@ -93,19 +116,22 @@ UV_CONNECT_CB_FOR_CLASS(EngineConnection, Connect) {
         return;
     }
     HLOG(INFO) << "Connected to engine, start writing handshake message";
-    uv_buf_t buf = {
-        .base = reinterpret_cast<char*>(&handshake_message_),
-        .len = sizeof(Message)
-    };
-    UV_DCHECK_OK(uv_write(launcher_->NewWriteRequest(), engine_conn_,
-                          &buf, 1, &EngineConnection::WriteHandshakeCallback));
+    uv_buf_t buf = {.base = reinterpret_cast<char*>(&handshake_message_),
+                    .len = sizeof(Message)};
+    UV_DCHECK_OK(uv_write(launcher_->NewWriteRequest(),
+                          engine_conn_,
+                          &buf,
+                          1,
+                          &EngineConnection::WriteHandshakeCallback));
 }
 
-UV_ALLOC_CB_FOR_CLASS(EngineConnection, BufferAlloc) {
+UV_ALLOC_CB_FOR_CLASS(EngineConnection, BufferAlloc)
+{
     launcher_->NewReadBuffer(suggested_size, buf);
 }
 
-UV_READ_CB_FOR_CLASS(EngineConnection, ReadHandshakeResponse) {
+UV_READ_CB_FOR_CLASS(EngineConnection, ReadHandshakeResponse)
+{
     auto reclaim_resource = gsl::finally([this, buf] {
         if (buf->base != 0) {
             launcher_->ReturnReadBuffer(buf);
@@ -118,7 +144,7 @@ UV_READ_CB_FOR_CLASS(EngineConnection, ReadHandshakeResponse) {
         return;
     }
     if (nread == 0) {
-        HLOG(WARNING) << "nread=0, will do nothing";
+        HLOG(WARNING) << "ReadHandshakeResponse: nread=0, will do nothing";
         return;
     }
     DCHECK_GT(nread, 0);
@@ -126,12 +152,14 @@ UV_READ_CB_FOR_CLASS(EngineConnection, ReadHandshakeResponse) {
     if (message_buffer_.length() >= sizeof(Message)) {
         Message* response = reinterpret_cast<Message*>(message_buffer_.data());
         DCHECK_GE(response->payload_size, 0);
-        size_t expected_size = sizeof(Message) + static_cast<size_t>(response->payload_size);
+        size_t expected_size =
+            sizeof(Message) + static_cast<size_t>(response->payload_size);
         if (message_buffer_.length() >= expected_size) {
             RecvHandshakeResponse();
             message_buffer_.ConsumeFront(expected_size);
             while (message_buffer_.length() >= sizeof(Message)) {
-                Message* message = reinterpret_cast<Message*>(message_buffer_.data());
+                Message* message =
+                    reinterpret_cast<Message*>(message_buffer_.data());
                 launcher_->OnRecvMessage(*message);
                 message_buffer_.ConsumeFront(sizeof(Message));
             }
@@ -139,13 +167,14 @@ UV_READ_CB_FOR_CLASS(EngineConnection, ReadHandshakeResponse) {
     }
 }
 
-UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteHandshake) {
-    auto reclaim_resource = gsl::finally([this, req] {
-        launcher_->ReturnWriteRequest(req);
-    });
+UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteHandshake)
+{
+    auto reclaim_resource =
+        gsl::finally([this, req] { launcher_->ReturnWriteRequest(req); });
     if (status != 0) {
-        HLOG(WARNING) << "Failed to write handshake message, will close the connection: "
-                      << uv_strerror(status);
+        HLOG(WARNING)
+            << "Failed to write handshake message, will close the connection: "
+            << uv_strerror(status);
         ScheduleClose();
         return;
     }
@@ -154,7 +183,8 @@ UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteHandshake) {
                                &EngineConnection::ReadHandshakeResponseCallback));
 }
 
-UV_READ_CB_FOR_CLASS(EngineConnection, ReadMessage) {
+UV_READ_CB_FOR_CLASS(EngineConnection, ReadMessage)
+{
     auto reclaim_resource = gsl::finally([this, buf] {
         if (buf->base != 0) {
             launcher_->ReturnReadBuffer(buf);
@@ -167,18 +197,19 @@ UV_READ_CB_FOR_CLASS(EngineConnection, ReadMessage) {
         return;
     }
     if (nread == 0) {
-        HLOG(WARNING) << "nread=0, will do nothing";
+        HLOG(WARNING) << "ReadMessage:nread=0, will do nothing";
         return;
     }
     DCHECK_GT(nread, 0);
     utils::ReadMessages<Message>(
-        &message_buffer_, buf->base, static_cast<size_t>(nread),
-        [this] (Message* message) {
-            launcher_->OnRecvMessage(*message);
-        });
+        &message_buffer_,
+        buf->base,
+        static_cast<size_t>(nread),
+        [this](Message* message) { launcher_->OnRecvMessage(*message); });
 }
 
-UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteMessage) {
+UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteMessage)
+{
     auto reclaim_resource = gsl::finally([this, req] {
         launcher_->ReturnWriteBuffer(reinterpret_cast<char*>(req->data));
         launcher_->ReturnWriteRequest(req);
@@ -190,7 +221,8 @@ UV_WRITE_CB_FOR_CLASS(EngineConnection, WriteMessage) {
     }
 }
 
-UV_CLOSE_CB_FOR_CLASS(EngineConnection, Close) {
+UV_CLOSE_CB_FOR_CLASS(EngineConnection, Close)
+{
     state_ = kClosed;
     if (engine_conn_ != nullptr) {
         free(engine_conn_);
@@ -198,5 +230,4 @@ UV_CLOSE_CB_FOR_CLASS(EngineConnection, Close) {
     launcher_->OnEngineConnectionClose();
 }
 
-}  // namespace launcher
-}  // namespace faas
+}} // namespace faas::launcher

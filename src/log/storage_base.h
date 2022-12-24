@@ -10,15 +10,20 @@
 #include "server/ingress_connection.h"
 #include "server/egress_hub.h"
 
-namespace faas {
-namespace log {
+namespace faas { namespace log {
 
-class StorageBase : public server::ServerBase {
+class StorageBase: public server::ServerBase {
 public:
     explicit StorageBase(uint16_t node_id);
     virtual ~StorageBase();
 
     void set_db_path(std::string_view path) { db_path_ = std::string(path); }
+
+    std::string cc_db_path_;
+    std::unique_ptr<DBInterface> cc_db_;
+    void set_cc_db_path(std::string_view path) { cc_db_path_ = std::string(path); }
+    void PutCCLogEntryToDB(CCLogEntry& cc_entry);
+    std::optional<CCLogEntry> GetCCLogEntryFromDB(uint64_t txn_id);
 
 protected:
     uint16_t my_node_id() const { return node_id_; }
@@ -84,10 +89,12 @@ private:
     void OnRemoteMessageConn(const protocol::HandshakeMessage& handshake,
                              int sockfd) override;
 
-    void OnRecvSharedLogMessage(int conn_type, uint16_t src_node_id,
+    void OnRecvSharedLogMessage(int conn_type,
+                                uint16_t src_node_id,
                                 const protocol::SharedLogMessage& message,
                                 std::span<const char> payload);
-    bool SendSharedLogMessage(protocol::ConnType conn_type, uint16_t dst_node_id,
+    bool SendSharedLogMessage(protocol::ConnType conn_type,
+                              uint16_t dst_node_id,
                               const protocol::SharedLogMessage& message,
                               std::span<const char> payload1,
                               std::span<const char> payload2 = EMPTY_CHAR_SPAN,
@@ -100,5 +107,4 @@ private:
     DISALLOW_COPY_AND_ASSIGN(StorageBase);
 };
 
-}  // namespace log
-}  // namespace faas
+}} // namespace faas::log

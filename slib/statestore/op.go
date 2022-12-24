@@ -13,6 +13,9 @@ const (
 	OP_ArrayPushBack
 	OP_ArrayPushBackWithLimit
 	OP_ArrayPopBack
+	OP_ArrayPushBackChecked
+	OP_ArrayRemoveAt
+	OP_ArrayRemoveChecked
 )
 
 type WriteOp struct {
@@ -248,6 +251,35 @@ func (obj *ObjectRef) ArrayPopBack(path string) *WriteResult {
 	})
 }
 
+func (obj *ObjectRef) ArrayPushBackChecked(path string, value Value, sizeLimit int) *WriteResult {
+	return obj.doWriteOp(&WriteOp{
+		OpType:   OP_ArrayPushBackChecked,
+		ObjName:  obj.name,
+		Path:     path,
+		Value:    value,
+		IntParam: sizeLimit,
+	})
+}
+
+func (obj *ObjectRef) ArrayRemoveAt(path string, value Value, index int) *WriteResult {
+	return obj.doWriteOp(&WriteOp{
+		OpType:   OP_ArrayRemoveAt,
+		ObjName:  obj.name,
+		Path:     path,
+		Value:    value,
+		IntParam: index,
+	})
+}
+
+func (obj *ObjectRef) ArrayRemoveChecked(path string, value Value) *WriteResult {
+	return obj.doWriteOp(&WriteOp{
+		OpType:  OP_ArrayRemoveChecked,
+		ObjName: obj.name,
+		Path:    path,
+		Value:   value,
+	})
+}
+
 func applySetOp(parent *gabs.Container, lastSeg string, value interface{}) (Value /* oldValue */, error) {
 	if current := parent.Search(lastSeg); current != nil {
 		oldValue := valueFromInterface(current.Data())
@@ -290,7 +322,8 @@ func applyMakeArrayOp(parent *gabs.Container, lastSeg string, arraySize int) err
 func applyDeleteOp(parent *gabs.Container, lastSeg string) (Value /* deletedValue */, error) {
 	current := parent.Search(lastSeg)
 	if current == nil {
-		return NullValue(), newPathNotExistError(lastSeg)
+		// return NullValue(), newPathNotExistError(lastSeg)
+		return NullValue(), nil
 	}
 	value := valueFromInterface(current.Data())
 	if err := current.Delete(lastSeg); err == nil {
@@ -381,6 +414,86 @@ func applyArrayPopBackOp(parent *gabs.Container, lastSeg string) (Value, error) 
 	}
 }
 
+func applyArrayPushBackCheckedOp(parent *gabs.Container, lastSeg string, value interface{}, sizeLimit int) (Value /* oldValue */, error) {
+	current := parent.Search(lastSeg)
+	if current == nil {
+		return NullValue(), newPathNotExistError(lastSeg)
+	}
+	if arr, ok := current.Data().([]interface{}); ok {
+		oldValue := NullValue()
+		for i := range arr {
+			if arr[i] == value {
+				return NullValue(), nil
+			}
+		}
+		newArr := append(arr, value)
+		if len(newArr) > sizeLimit {
+			oldValue = valueFromInterface(arr[0])
+			newArr = arr[1:]
+		}
+		if _, err := parent.Set(newArr, lastSeg); err == nil {
+			return oldValue, nil
+		} else {
+			return NullValue(), newGabsError(err)
+		}
+	} else {
+		return NullValue(), newBadArgumentsError("Expect array type")
+	}
+}
+
+func applyArrayRemoveAtOp(parent *gabs.Container, lastSeg string, value interface{}, index int) (Value /* oldValue */, error) {
+	current := parent.Search(lastSeg)
+	if current == nil {
+		return NullValue(), newPathNotExistError(lastSeg)
+	}
+	if arr, ok := current.Data().([]interface{}); ok {
+		if index < 0 || index >= len(arr) {
+			return NullValue(), newBadArgumentsError("Index out of range")
+		}
+		oldValue := valueFromInterface(arr[index])
+		// arr = append(arr[:idx], arr[idx+1:]...)
+		arr[index] = arr[len(arr)-1]
+		newArr := arr[:len(arr)-1]
+		if _, err := parent.Set(newArr, lastSeg); err == nil {
+			return oldValue, nil
+		} else {
+			return NullValue(), newGabsError(err)
+		}
+	} else {
+		return NullValue(), newBadArgumentsError("Expect array type")
+	}
+}
+
+func applyArrayRemoveCheckedOp(parent *gabs.Container, lastSeg string, value interface{}) (Value /* oldValue */, error) {
+	current := parent.Search(lastSeg)
+	if current == nil {
+		return NullValue(), newPathNotExistError(lastSeg)
+	}
+	if arr, ok := current.Data().([]interface{}); ok {
+		idx := -1
+		for i := range arr {
+			if arr[i] == value {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			return NullValue(), nil
+		}
+		oldValue := valueFromInterface(arr[idx])
+		// arr = append(arr[:idx], arr[idx+1:]...)
+		arr[idx] = arr[len(arr)-1]
+		newArr := arr[:len(arr)-1]
+		if _, err := parent.Set(newArr, lastSeg); err == nil {
+			return oldValue, nil
+		} else {
+			return NullValue(), newGabsError(err)
+		}
+	} else {
+		return NullValue(), newBadArgumentsError("Expect array type")
+	}
+}
+
 func (view *ObjectView) applyWriteOp(op *WriteOp) (Value, error) {
 	pathSegs := gabs.DotPathToSlice(op.Path)
 	if len(pathSegs) == 0 {
@@ -408,6 +521,12 @@ func (view *ObjectView) applyWriteOp(op *WriteOp) (Value, error) {
 		return applyArrayPushBackWithLimitOp(parent, lastSeg, op.Value.asInterface(), op.IntParam)
 	case OP_ArrayPopBack:
 		return applyArrayPopBackOp(parent, lastSeg)
+	case OP_ArrayPushBackChecked:
+		return applyArrayPushBackCheckedOp(parent, lastSeg, op.Value.asInterface(), op.IntParam)
+	case OP_ArrayRemoveAt:
+		return applyArrayRemoveAtOp(parent, lastSeg, op.Value.asInterface(), op.IntParam)
+	case OP_ArrayRemoveChecked:
+		return applyArrayRemoveCheckedOp(parent, lastSeg, op.Value.asInterface())
 	default:
 		panic("Unknown WriteOp!")
 	}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/protocol.h"
 #include "common/zk.h"
 #include "log/common.h"
 #include "log/view.h"
@@ -9,13 +10,42 @@
 #include "server/io_worker.h"
 #include "utils/object_pool.h"
 #include "utils/appendable_buffer.h"
+#include <memory>
 
 namespace faas {
 
 // Forward declaration
-namespace engine { class Engine; }
+namespace engine {
+class Engine;
+}
 
 namespace log {
+
+struct LocalOp {
+    bool is_cc_op;
+    protocol::SharedLogOpType type;
+    uint16_t client_id;
+    uint32_t user_logspace;
+    uint32_t logspace_id;
+    uint64_t id;
+    uint64_t client_data;
+    uint64_t metalog_progress;
+    uint64_t query_tag;
+    uint64_t seqnum;
+    uint64_t func_call_id;
+    int64_t start_timestamp;
+    // cc
+    uint64_t txn_localid;
+    std::unique_ptr<protocol::SharedLogMessage> message;
+    // protocol::SharedLogMessage* message;
+    UserTagVec user_tags;
+    utils::AppendableBuffer data;
+
+    // LocalOp()
+    // {
+    //     message.reset(protocol::SharedLogMessageHelper::NewEmptySharedLogMessage());
+    // }
+};
 
 class EngineBase {
 public:
@@ -25,15 +55,34 @@ public:
     void Start();
     void Stop();
 
-    void OnRecvSharedLogMessage(int conn_type, uint16_t src_node_id,
+    void OnRecvSharedLogMessage(int conn_type,
+                                uint16_t src_node_id,
                                 const protocol::SharedLogMessage& message,
                                 std::span<const char> payload);
 
-    void OnNewExternalFuncCall(const protocol::FuncCall& func_call, uint32_t log_space);
+    void OnNewExternalFuncCall(const protocol::FuncCall& func_call,
+                               uint32_t log_space);
     void OnNewInternalFuncCall(const protocol::FuncCall& func_call,
                                const protocol::FuncCall& parent_func_call);
     void OnFuncCallCompleted(const protocol::FuncCall& func_call);
     void OnMessageFromFuncWorker(const protocol::Message& message);
+
+    void ReplicateCCLogEntry(const View* view,
+                             protocol::SharedLogMessage* message,
+                             std::span<const char> payload);
+
+    std::optional<LRUCache> cc_log_cache_;
+    void CCLogCachePut(CCLogEntry* cc_entry);
+    std::optional<CCLogEntry> CCLogCacheGet(uint64_t txn_localid);
+    void CCLogCachePutAuxData(uint64_t global_batch_id,
+                              uint64_t key,
+                              std::span<const char> aux_data);
+    std::optional<std::string> CCLogCacheGetAuxData(uint64_t global_batch_id,
+                                                    uint64_t key);
+
+    bool SendStorageCCReadRequest(LocalOp* op,
+                                  CCIndex::IndexEntry& idx_entry,
+                                  const View::Engine* engine_node);
 
 protected:
     uint16_t my_node_id() const { return node_id_; }
@@ -50,44 +99,40 @@ protected:
                                     std::span<const char> payload) = 0;
     virtual void OnRecvResponse(const protocol::SharedLogMessage& message,
                                 std::span<const char> payload) = 0;
+    virtual void OnRecvCCGlobalBatch(const protocol::SharedLogMessage& message,
+                                     std::span<const char> payload) = 0;
 
     void MessageHandler(const protocol::SharedLogMessage& message,
                         std::span<const char> payload);
-
-    struct LocalOp {
-        protocol::SharedLogOpType type;
-        uint16_t client_id;
-        uint32_t user_logspace;
-        uint64_t id;
-        uint64_t client_data;
-        uint64_t metalog_progress;
-        uint64_t query_tag;
-        uint64_t seqnum;
-        uint64_t func_call_id;
-        int64_t start_timestamp;
-        UserTagVec user_tags;
-        utils::AppendableBuffer data;
-    };
 
     virtual void HandleLocalAppend(LocalOp* op) = 0;
     virtual void HandleLocalTrim(LocalOp* op) = 0;
     virtual void HandleLocalRead(LocalOp* op) = 0;
     virtual void HandleLocalSetAuxData(LocalOp* op) = 0;
 
+    virtual void HandleLocalCCTxnStart(LocalOp* op) = 0;
+    virtual void HandleLocalCCTxnCommit(LocalOp* op) = 0;
+    // virtual void HandleLocalReadLock(LocalOp* op) = 0;
+
     void LocalOpHandler(LocalOp* op);
 
-    void ReplicateLogEntry(const View* view, const LogMetaData& log_metadata,
+    void ReplicateLogEntry(const View* view,
+                           const LogMetaData& log_metadata,
                            std::span<const uint64_t> user_tags,
                            std::span<const char> log_data);
-    void PropagateAuxData(const View* view, const LogMetaData& log_metadata, 
+    void PropagateAuxData(const View* view,
+                          const LogMetaData& log_metadata,
                           std::span<const char> aux_data);
 
-    void FinishLocalOpWithResponse(LocalOp* op, protocol::Message* response,
+    void FinishLocalOpWithResponse(LocalOp* op,
+                                   protocol::Message* response,
                                    uint64_t metalog_progress);
-    void FinishLocalOpWithFailure(LocalOp* op, protocol::SharedLogResultType result,
+    void FinishLocalOpWithFailure(LocalOp* op,
+                                  protocol::SharedLogResultType result,
                                   uint64_t metalog_progress = 0);
 
-    void LogCachePut(const LogMetaData& log_metadata, std::span<const uint64_t> user_tags,
+    void LogCachePut(const LogMetaData& log_metadata,
+                     std::span<const uint64_t> user_tags,
                      std::span<const char> log_data);
     std::optional<LogEntry> LogCacheGet(uint64_t seqnum);
     void LogCachePutAuxData(uint64_t seqnum, std::span<const char> data);
@@ -127,8 +172,8 @@ private:
     };
 
     absl::Mutex fn_ctx_mu_;
-    absl::flat_hash_map</* full_call_id */ uint64_t, FnCallContext>
-        fn_call_ctx_ ABSL_GUARDED_BY(fn_ctx_mu_);
+    absl::flat_hash_map</* full_call_id */ uint64_t, FnCallContext> fn_call_ctx_
+        ABSL_GUARDED_BY(fn_ctx_mu_);
 
     std::optional<LRUCache> log_cache_;
 
@@ -136,9 +181,11 @@ private:
     void SetupTimers();
 
     void PopulateLogTagsAndData(const protocol::Message& message, LocalOp* op);
+    void PopulateCCOpPayload(const protocol::Message& message, LocalOp* op);
+    // void PopulateTxnCommitPayload(const protocol::Message& message, LocalOp* op);
 
     DISALLOW_COPY_AND_ASSIGN(EngineBase);
 };
 
-}  // namespace log
-}  // namespace faas
+} // namespace log
+} // namespace faas

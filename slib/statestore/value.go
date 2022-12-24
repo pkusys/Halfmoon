@@ -13,7 +13,10 @@ const (
 	VALUE_EmptyArray
 	VALUE_Object
 	VALUE_Array
+	VALUE_Updatable
 )
+
+// type Updatable interface {
 
 type Value struct {
 	ValueType   int                    `json:"t"`

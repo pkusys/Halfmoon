@@ -3,21 +3,28 @@
 #include "utils/env_variables.h"
 #include "log/storage.h"
 
-ABSL_FLAG(int, node_id, -1,
+ABSL_FLAG(int,
+          node_id,
+          -1,
           "My node ID. Also settable through environment variable FAAS_NODE_ID.");
 ABSL_FLAG(std::string, db_path, "", "Path for RocksDB database storage.");
+ABSL_FLAG(std::string, cc_db_path, "", "Path for RocksDB database storage.");
 
 namespace faas {
 
 static std::atomic<server::ServerBase*> server_ptr{nullptr};
-static void StopServerHandler() {
+static void
+StopServerHandler()
+{
     server::ServerBase* server = server_ptr.exchange(nullptr);
     if (server != nullptr) {
         server->ScheduleStop();
     }
 }
 
-void StorageMain(int argc, char* argv[]) {
+void
+StorageMain(int argc, char* argv[])
+{
     base::InitMain(argc, argv);
     base::SetInterruptHandler(StopServerHandler);
 
@@ -31,15 +38,18 @@ void StorageMain(int argc, char* argv[]) {
     auto storage = std::make_unique<log::Storage>(node_id);
 
     storage->set_db_path(absl::GetFlag(FLAGS_db_path));
+    storage->set_cc_db_path(absl::GetFlag(FLAGS_cc_db_path));
 
     storage->Start();
     server_ptr.store(storage.get());
     storage->WaitForFinish();
 }
 
-}  // namespace faas
+} // namespace faas
 
-int main(int argc, char* argv[]) {
+int
+main(int argc, char* argv[])
+{
     faas::StorageMain(argc, argv);
     return 0;
 }

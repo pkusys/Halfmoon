@@ -256,7 +256,7 @@ void HttpConnection::HttpParserOnNewHeader() {
     std::string_view value(header_value_buffer_.data() + header_value_buffer_pos_,
                            header_value_buffer_.length() - header_value_buffer_pos_);
     header_value_buffer_pos_ = header_value_buffer_.length();
-    HVLOG(1) << "Parse new HTTP header: " << field << " = " << value;
+    // HVLOG(1) << "Parse new HTTP header: " << field << " = " << value;
     std::string field_str = absl::AsciiStrToLower(field);
     headers_[field_str] = value;
 }

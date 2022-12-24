@@ -3,6 +3,7 @@
 #include "base/common.h"
 #include "common/protocol.h"
 #include "engine/message_connection.h"
+#include "server/io_worker.h"
 
 namespace faas {
 namespace engine {
@@ -50,6 +51,8 @@ public:
 
     // Must be thread-safe
     void SendMessage(protocol::Message* message);
+
+    server::IOWorker* GetIOWorker() const;
 
 private:
     uint16_t func_id_;

@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 
+#include "base/logging.h"
 #include "common/time.h"
 #include "engine/flags.h"
 #include "ipc/base.h"
@@ -14,8 +15,7 @@
 
 #define log_header_ "Engine: "
 
-namespace faas {
-namespace engine {
+namespace faas { namespace engine {
 
 using protocol::FuncCall;
 using protocol::FuncCallHelper;
@@ -32,29 +32,41 @@ using server::IOWorker;
 using server::NodeWatcher;
 
 Engine::Engine(uint16_t node_id)
-    : ServerBase(fmt::format("engine_{}", node_id)), engine_tcp_port_(-1),
-      enable_shared_log_(false), node_id_(node_id),
-      func_worker_use_engine_socket_(absl::GetFlag(FLAGS_func_worker_use_engine_socket)),
-      use_fifo_for_nested_call_(absl::GetFlag(FLAGS_use_fifo_for_nested_call)), ipc_sockfd_(-1),
-      worker_manager_(this), tracer_(this), inflight_external_requests_(0),
+    : ServerBase(fmt::format("engine_{}", node_id)),
+      engine_tcp_port_(-1),
+      enable_shared_log_(false),
+      node_id_(node_id),
+      func_worker_use_engine_socket_(
+          absl::GetFlag(FLAGS_func_worker_use_engine_socket)),
+      use_fifo_for_nested_call_(absl::GetFlag(FLAGS_use_fifo_for_nested_call)),
+      ipc_sockfd_(-1),
+      worker_manager_(this),
+      tracer_(this),
+      inflight_external_requests_(0),
       last_external_request_timestamp_(-1),
       incoming_external_requests_stat_(
           stat::Counter::StandardReportCallback("incoming_external_requests")),
       incoming_internal_requests_stat_(
           stat::Counter::StandardReportCallback("incoming_internal_requests")),
-      external_requests_instant_rps_stat_(stat::StatisticsCollector<float>::StandardReportCallback(
-          "external_requests_instant_rps")),
-      inflight_external_requests_stat_(stat::StatisticsCollector<uint16_t>::StandardReportCallback(
-          "inflight_external_requests")),
-      message_delay_stat_(
-          stat::StatisticsCollector<int32_t>::StandardReportCallback("message_delay")),
+      external_requests_instant_rps_stat_(
+          stat::StatisticsCollector<float>::StandardReportCallback(
+              "external_requests_instant_rps")),
+      inflight_external_requests_stat_(
+          stat::StatisticsCollector<uint16_t>::StandardReportCallback(
+              "inflight_external_requests")),
+      message_delay_stat_(stat::StatisticsCollector<int32_t>::StandardReportCallback(
+          "message_delay")),
       input_use_shm_stat_(stat::Counter::StandardReportCallback("input_use_shm")),
       output_use_shm_stat_(stat::Counter::StandardReportCallback("output_use_shm")),
-      discarded_func_call_stat_(stat::Counter::StandardReportCallback("discarded_func_call")) {}
+      discarded_func_call_stat_(
+          stat::Counter::StandardReportCallback("discarded_func_call"))
+{}
 
 Engine::~Engine() {}
 
-void Engine::StartInternal() {
+void
+Engine::StartInternal()
+{
     // Load function config file
     CHECK(!func_config_file_.empty());
     CHECK(fs_utils::ReadContents(func_config_file_, &func_config_json_))
@@ -66,7 +78,8 @@ void Engine::StartInternal() {
         shared_log_engine_->Start();
     }
     // Setup callbacks for node watcher
-    node_watcher()->SetNodeOnlineCallback(absl::bind_front(&Engine::OnNodeOnline, this));
+    node_watcher()->SetNodeOnlineCallback(
+        absl::bind_front(&Engine::OnNodeOnline, this));
     // Initialize tracer and monitor
     tracer_.Init();
     if (absl::GetFlag(FLAGS_enable_monitor)) {
@@ -75,10 +88,13 @@ void Engine::StartInternal() {
     }
 }
 
-void Engine::SetupGatewayEgress() {
+void
+Engine::SetupGatewayEgress()
+{
     bool failed = false;
-    ForEachIOWorker([&failed, this](IOWorker *io_worker) {
-        EgressHub *hub = CreateEgressHub(protocol::ConnType::ENGINE_TO_GATEWAY, 0, io_worker);
+    ForEachIOWorker([&failed, this](IOWorker* io_worker) {
+        EgressHub* hub =
+            CreateEgressHub(protocol::ConnType::ENGINE_TO_GATEWAY, 0, io_worker);
         if (hub == nullptr) {
             HLOG(ERROR) << "Failed to create EgressHub for gateway";
             failed = true;
@@ -89,7 +105,9 @@ void Engine::SetupGatewayEgress() {
     }
 }
 
-void Engine::SetupLocalIpc() {
+void
+Engine::SetupLocalIpc()
+{
     int listen_backlog = absl::GetFlag(FLAGS_socket_listen_backlog);
     if (engine_tcp_port_ == -1) {
         std::string ipc_path(ipc::GetEngineUnixSocketPath());
@@ -103,21 +121,31 @@ void Engine::SetupLocalIpc() {
         std::string address = absl::GetFlag(FLAGS_listen_addr);
         CHECK(!address.empty());
         ipc_sockfd_ = utils::TcpSocketBindAndListen(
-            address, gsl::narrow_cast<uint16_t>(engine_tcp_port_), listen_backlog);
-        CHECK(ipc_sockfd_ != -1) << fmt::format("Failed to listen on {}:{}", address,
-                                                engine_tcp_port_);
-        HLOG_F(INFO, "Listen on {}:{} for IPC connections", address, engine_tcp_port_);
+            address,
+            gsl::narrow_cast<uint16_t>(engine_tcp_port_),
+            listen_backlog);
+        CHECK(ipc_sockfd_ != -1)
+            << fmt::format("Failed to listen on {}:{}", address, engine_tcp_port_);
+        HLOG_F(INFO,
+               "Listen on {}:{} for IPC connections",
+               address,
+               engine_tcp_port_);
     }
-    ListenForNewConnections(ipc_sockfd_, absl::bind_front(&Engine::OnNewLocalIpcConn, this));
+    ListenForNewConnections(ipc_sockfd_,
+                            absl::bind_front(&Engine::OnNewLocalIpcConn, this));
 }
 
-void Engine::OnNodeOnline(NodeWatcher::NodeType node_type, uint16_t node_id) {
+void
+Engine::OnNodeOnline(NodeWatcher::NodeType node_type, uint16_t node_id)
+{
     if (node_type == NodeWatcher::kGatewayNode) {
         SetupGatewayEgress();
     }
 }
 
-void Engine::StopInternal() {
+void
+Engine::StopInternal()
+{
     if (ipc_sockfd_ != -1) {
         PCHECK(close(ipc_sockfd_) == 0) << "Failed to close local IPC server fd";
     }
@@ -126,7 +154,9 @@ void Engine::StopInternal() {
     }
 }
 
-void Engine::OnConnectionClose(ConnectionBase *connection) {
+void
+Engine::OnConnectionClose(ConnectionBase* connection)
+{
     DCHECK(WithinMyEventLoopThread());
     switch (connection->type() & kConnectionTypeMask) {
     case kMessageConnectionTypeId:
@@ -152,20 +182,27 @@ void Engine::OnConnectionClose(ConnectionBase *connection) {
         break;
     case kSequencerEgressHubTypeId:
     case kEngineEgressHubTypeId:
-    case kStorageEgressHubTypeId: {
-        absl::MutexLock lk(&conn_mu_);
-        DCHECK(egress_hubs_.contains(connection->id()));
-        egress_hubs_.erase(connection->id());
-    } break;
+    case kStorageEgressHubTypeId:
+        {
+            absl::MutexLock lk(&conn_mu_);
+            DCHECK(egress_hubs_.contains(connection->id()));
+            egress_hubs_.erase(connection->id());
+        }
+        break;
     default:
         HLOG(FATAL) << "Unknown connection type: " << connection->type();
     }
 }
 
-bool Engine::OnNewHandshake(MessageConnection *connection, const Message &handshake_message,
-                            Message *response, std::span<const char> *response_payload) {
+bool
+Engine::OnNewHandshake(MessageConnection* connection,
+                       const Message& handshake_message,
+                       Message* response,
+                       std::span<const char>* response_payload)
+{
     if (!MessageHelper::IsLauncherHandshake(handshake_message) &&
-        !MessageHelper::IsFuncWorkerHandshake(handshake_message)) {
+        !MessageHelper::IsFuncWorkerHandshake(handshake_message))
+    {
         HLOG(ERROR) << "Received message is not a handshake message";
         return false;
     }
@@ -177,14 +214,17 @@ bool Engine::OnNewHandshake(MessageConnection *connection, const Message &handsh
     }
     bool success;
     if (MessageHelper::IsLauncherHandshake(handshake_message)) {
-        std::span<const char> payload = MessageHelper::GetInlineData(handshake_message);
+        std::span<const char> payload =
+            MessageHelper::GetInlineData(handshake_message);
         if (payload.size() != docker_utils::kContainerIdLength) {
             HLOG(ERROR) << "Launcher handshake does not have container ID in "
                            "inline data";
             return false;
         }
         std::string container_id(payload.data(), payload.size());
-        if (monitor_.has_value() && container_id != docker_utils::kInvalidContainerId) {
+        if (monitor_.has_value() &&
+            container_id != docker_utils::kInvalidContainerId)
+        {
             monitor_->OnNewFuncContainer(func_id, container_id);
         }
         success = worker_manager_.OnLauncherConnected(connection);
@@ -213,7 +253,9 @@ bool Engine::OnNewHandshake(MessageConnection *connection, const Message &handsh
     return true;
 }
 
-void Engine::OnLocalIpcConnClosed(MessageConnection *conn) {
+void
+Engine::OnLocalIpcConnClosed(MessageConnection* conn)
+{
     if (conn->handshake_done()) {
         if (conn->is_launcher_connection()) {
             worker_manager_.OnLauncherDisconnected(conn);
@@ -223,7 +265,10 @@ void Engine::OnLocalIpcConnClosed(MessageConnection *conn) {
     }
 }
 
-void Engine::OnRecvGatewayMessage(const GatewayMessage &message, std::span<const char> payload) {
+void
+Engine::OnRecvGatewayMessage(const GatewayMessage& message,
+                             std::span<const char> payload)
+{
     if (GatewayMessageHelper::IsDispatchFuncCall(message)) {
         FuncCall func_call = GatewayMessageHelper::GetFuncCall(message);
         OnExternalFuncCall(func_call, message.logspace, payload);
@@ -232,15 +277,18 @@ void Engine::OnRecvGatewayMessage(const GatewayMessage &message, std::span<const
     }
 }
 
-void Engine::HandleInvokeFuncMessage(const Message &message) {
+void
+Engine::HandleInvokeFuncMessage(const Message& message)
+{
     DCHECK(MessageHelper::IsInvokeFunc(message));
     int32_t message_delay = MessageHelper::ComputeMessageDelay(message);
     FuncCall func_call = MessageHelper::GetFuncCall(message);
     FuncCall parent_func_call;
     parent_func_call.full_call_id = message.parent_call_id;
     bool is_async = (message.flags & protocol::kAsyncInvokeFuncFlag) != 0;
-    AsyncFuncCall async_call = {
-        .func_call = func_call, .parent_func_call = parent_func_call, .input_region = nullptr};
+    AsyncFuncCall async_call = {.func_call = func_call,
+                                .parent_func_call = parent_func_call,
+                                .input_region = nullptr};
     if (is_async && message.payload_size < 0) {
         async_call.input_region =
             ipc::ShmOpen(ipc::GetFuncCallInputShmName(func_call.full_call_id));
@@ -251,7 +299,7 @@ void Engine::HandleInvokeFuncMessage(const Message &message) {
         }
         async_call.input_region->EnableRemoveOnDestruction();
     }
-    Dispatcher *dispatcher = nullptr;
+    Dispatcher* dispatcher = nullptr;
     {
         absl::MutexLock lk(&mu_);
         incoming_internal_requests_stat_.Tick();
@@ -267,23 +315,28 @@ void Engine::HandleInvokeFuncMessage(const Message &message) {
         }
     }
     if (enable_shared_log_) {
-        DCHECK_NOTNULL(shared_log_engine_)->OnNewInternalFuncCall(func_call, parent_func_call);
+        DCHECK_NOTNULL(shared_log_engine_)
+            ->OnNewInternalFuncCall(func_call, parent_func_call);
     }
     bool success = false;
     if (dispatcher != nullptr) {
         if (message.payload_size < 0) {
             success = dispatcher->OnNewFuncCall(
-                func_call, is_async ? protocol::kInvalidFuncCall : parent_func_call,
+                func_call,
+                is_async ? protocol::kInvalidFuncCall : parent_func_call,
                 /* input_size= */
-                gsl::narrow_cast<size_t>(-message.payload_size), EMPTY_CHAR_SPAN,
+                gsl::narrow_cast<size_t>(-message.payload_size),
+                EMPTY_CHAR_SPAN,
                 /* shm_input= */ true);
 
         } else {
             success = dispatcher->OnNewFuncCall(
-                func_call, is_async ? protocol::kInvalidFuncCall : parent_func_call,
+                func_call,
+                is_async ? protocol::kInvalidFuncCall : parent_func_call,
                 /* input_size= */
                 gsl::narrow_cast<size_t>(message.payload_size),
-                MessageHelper::GetInlineData(message), /* shm_input= */ false);
+                MessageHelper::GetInlineData(message),
+                /* shm_input= */ false);
         }
     }
     if (!success) {
@@ -297,16 +350,20 @@ void Engine::HandleInvokeFuncMessage(const Message &message) {
         }
     }
     if (is_async) {
-        Message response = MessageHelper::NewFuncCallComplete(func_call, /* processing_time= */ 0);
+        Message response =
+            MessageHelper::NewFuncCallComplete(func_call,
+                                               /* processing_time= */ 0);
         SendFuncWorkerMessage(func_call.client_id, &response);
     }
 }
 
-void Engine::HandleFuncCallCompleteMessage(const Message &message) {
+void
+Engine::HandleFuncCallCompleteMessage(const Message& message)
+{
     DCHECK(MessageHelper::IsFuncCallComplete(message));
     int32_t message_delay = MessageHelper::ComputeMessageDelay(message);
     FuncCall func_call = MessageHelper::GetFuncCall(message);
-    Dispatcher *dispatcher = nullptr;
+    Dispatcher* dispatcher = nullptr;
     std::unique_ptr<ipc::ShmRegion> input_region = nullptr;
     bool is_async_call = false;
     AsyncFuncCall async_call;
@@ -326,7 +383,8 @@ void Engine::HandleFuncCallCompleteMessage(const Message &message) {
             // Internal FuncCall
             if (use_fifo_for_nested_call_) {
                 DCHECK_GE(message.payload_size, 0);
-                size_t msg_size = static_cast<size_t>(message.payload_size) + sizeof(int32_t);
+                size_t msg_size =
+                    static_cast<size_t>(message.payload_size) + sizeof(int32_t);
                 if (msg_size > size_t{PIPE_BUF}) {
                     output_use_shm_stat_.Tick();
                 }
@@ -341,10 +399,12 @@ void Engine::HandleFuncCallCompleteMessage(const Message &message) {
         DCHECK_NOTNULL(shared_log_engine_)->OnFuncCallCompleted(func_call);
     }
     DCHECK(dispatcher != nullptr);
-    bool ret =
-        dispatcher->OnFuncCallCompleted(func_call, message.processing_time, message.dispatch_delay,
-                                        /* output_size= */
-                                        gsl::narrow_cast<size_t>(std::abs(message.payload_size)));
+    bool ret = dispatcher->OnFuncCallCompleted(
+        func_call,
+        message.processing_time,
+        message.dispatch_delay,
+        /* output_size= */
+        gsl::narrow_cast<size_t>(std::abs(message.payload_size)));
     if (!ret) {
         HLOG(ERROR) << "Dispatcher::OnFuncCallCompleted failed";
         return;
@@ -357,17 +417,20 @@ void Engine::HandleFuncCallCompleteMessage(const Message &message) {
                 ExternalFuncCallFailed(func_call);
             } else {
                 output_region->EnableRemoveOnDestruction();
-                ExternalFuncCallCompleted(func_call, output_region->to_span(),
+                ExternalFuncCallCompleted(func_call,
+                                          output_region->to_span(),
                                           message.processing_time);
             }
         } else {
-            ExternalFuncCallCompleted(func_call, MessageHelper::GetInlineData(message),
+            ExternalFuncCallCompleted(func_call,
+                                      MessageHelper::GetInlineData(message),
                                       message.processing_time);
         }
     } else if (is_async_call) {
         if (message.payload_size < 0) {
-            HLOG(WARNING) << "Async function call has a large output, that uses shm: "
-                          << FuncCallHelper::DebugString(func_call);
+            HLOG(WARNING)
+                << "Async function call has a large output, that uses shm: "
+                << FuncCallHelper::DebugString(func_call);
             auto output_region =
                 ipc::ShmOpen(ipc::GetFuncCallOutputShmName(func_call.full_call_id));
             if (output_region != nullptr) {
@@ -380,11 +443,13 @@ void Engine::HandleFuncCallCompleteMessage(const Message &message) {
     }
 }
 
-void Engine::HandleFuncCallFailedMessage(const Message &message) {
+void
+Engine::HandleFuncCallFailedMessage(const Message& message)
+{
     DCHECK(MessageHelper::IsFuncCallFailed(message));
     int32_t message_delay = MessageHelper::ComputeMessageDelay(message);
     FuncCall func_call = MessageHelper::GetFuncCall(message);
-    Dispatcher *dispatcher = nullptr;
+    Dispatcher* dispatcher = nullptr;
     std::unique_ptr<ipc::ShmRegion> input_region = nullptr;
     bool is_async_call = false;
     AsyncFuncCall async_call;
@@ -419,13 +484,17 @@ void Engine::HandleFuncCallFailedMessage(const Message &message) {
     }
 }
 
-void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
-                                std::span<const char> input) {
+void
+Engine::OnExternalFuncCall(const FuncCall& func_call,
+                           uint32_t logspace,
+                           std::span<const char> input)
+{
     inflight_external_requests_.fetch_add(1, std::memory_order_relaxed);
     std::unique_ptr<ipc::ShmRegion> input_region = nullptr;
     if (input.size() > MESSAGE_INLINE_DATA_SIZE) {
         input_region =
-            ipc::ShmCreate(ipc::GetFuncCallInputShmName(func_call.full_call_id), input.size());
+            ipc::ShmCreate(ipc::GetFuncCallInputShmName(func_call.full_call_id),
+                           input.size());
         if (input_region == nullptr) {
             ExternalFuncCallFailed(func_call);
             return;
@@ -435,7 +504,7 @@ void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
             memcpy(input_region->base(), input.data(), input.size());
         }
     }
-    Dispatcher *dispatcher = nullptr;
+    Dispatcher* dispatcher = nullptr;
     mu_.AssertNotHeld();
     {
         absl::MutexLock lk(&mu_);
@@ -446,7 +515,8 @@ void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
         }
         if (last_external_request_timestamp_ != -1) {
             int64_t delta = current_timestamp - last_external_request_timestamp_;
-            external_requests_instant_rps_stat_.AddSample(1e6f / gsl::narrow_cast<float>(delta));
+            external_requests_instant_rps_stat_.AddSample(
+                1e6f / gsl::narrow_cast<float>(delta));
         }
         last_external_request_timestamp_ = current_timestamp;
         inflight_external_requests_stat_.AddSample(gsl::narrow_cast<uint16_t>(
@@ -454,7 +524,8 @@ void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
         dispatcher = GetOrCreateDispatcherLocked(func_call.func_id);
         if (input_region != nullptr) {
             if (dispatcher != nullptr) {
-                external_func_call_shm_inputs_[func_call.full_call_id] = std::move(input_region);
+                external_func_call_shm_inputs_[func_call.full_call_id] =
+                    std::move(input_region);
             }
             input_use_shm_stat_.Tick();
         }
@@ -464,16 +535,22 @@ void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
         return;
     }
     if (enable_shared_log_) {
-        DCHECK_NOTNULL(shared_log_engine_)->OnNewExternalFuncCall(func_call, logspace);
+        DCHECK_NOTNULL(shared_log_engine_)
+            ->OnNewExternalFuncCall(func_call, logspace);
     }
     bool ret = false;
     if (input.size() <= MESSAGE_INLINE_DATA_SIZE) {
-        ret = dispatcher->OnNewFuncCall(func_call, protocol::kInvalidFuncCall, input.size(),
+        ret = dispatcher->OnNewFuncCall(func_call,
+                                        protocol::kInvalidFuncCall,
+                                        input.size(),
                                         /* inline_input= */ input,
                                         /* shm_input= */ false);
     } else {
-        ret = dispatcher->OnNewFuncCall(func_call, protocol::kInvalidFuncCall, input.size(),
-                                        /* inline_input= */ EMPTY_CHAR_SPAN, /* shm_input= */ true);
+        ret = dispatcher->OnNewFuncCall(func_call,
+                                        protocol::kInvalidFuncCall,
+                                        input.size(),
+                                        /* inline_input= */ EMPTY_CHAR_SPAN,
+                                        /* shm_input= */ true);
     }
     if (!ret) {
         HLOG(ERROR) << "Dispatcher::OnNewFuncCall failed";
@@ -488,7 +565,9 @@ void Engine::OnExternalFuncCall(const FuncCall &func_call, uint32_t logspace,
     }
 }
 
-void Engine::HandleSharedLogOpMessage(const Message &message) {
+void
+Engine::HandleSharedLogOpMessage(const Message& message)
+{
     DCHECK(MessageHelper::IsSharedLogOp(message));
     if (!enable_shared_log_) {
         HLOG(FATAL) << "Shared log disabled!";
@@ -497,7 +576,9 @@ void Engine::HandleSharedLogOpMessage(const Message &message) {
     DCHECK_NOTNULL(shared_log_engine_)->OnMessageFromFuncWorker(message);
 }
 
-void Engine::OnRecvMessage(MessageConnection *connection, const Message &message) {
+void
+Engine::OnRecvMessage(MessageConnection* connection, const Message& message)
+{
     if (MessageHelper::IsInvokeFunc(message)) {
         HandleInvokeFuncMessage(message);
     } else if (MessageHelper::IsFuncCallComplete(message)) {
@@ -512,46 +593,68 @@ void Engine::OnRecvMessage(MessageConnection *connection, const Message &message
     ProcessDiscardedFuncCallIfNecessary();
 }
 
-void Engine::SendGatewayMessage(const GatewayMessage &message, std::span<const char> payload) {
-    EgressHub *hub = CurrentIOWorkerChecked()->PickConnectionAs<EgressHub>(kGatewayEgressHubTypeId);
+void
+Engine::SendGatewayMessage(const GatewayMessage& message,
+                           std::span<const char> payload)
+{
+    EgressHub* hub = CurrentIOWorkerChecked()->PickConnectionAs<EgressHub>(
+        kGatewayEgressHubTypeId);
     if (hub == nullptr) {
-        HLOG(ERROR) << "There is not GatewayEgressHub associated with current IOWorker";
+        HLOG(ERROR)
+            << "There is not GatewayEgressHub associated with current IOWorker";
         return;
     }
-    std::span<const char> data(reinterpret_cast<const char *>(&message), sizeof(GatewayMessage));
+    std::span<const char> data(reinterpret_cast<const char*>(&message),
+                               sizeof(GatewayMessage));
     hub->SendMessage(data, payload);
 }
 
-bool Engine::SendFuncWorkerMessage(uint16_t client_id, Message *message) {
+bool
+Engine::SendFuncWorkerMessage(uint16_t client_id, Message* message)
+{
     auto func_worker = worker_manager_.GetFuncWorker(client_id);
     if (func_worker == nullptr) {
         return false;
     }
+    // HVLOG(1) << fmt::format("sending message to func worker {}(IO-{})",
+    //                         func_worker->client_id(),
+    //                         func_worker->GetIOWorker()->worker_id());
     func_worker->SendMessage(message);
     return true;
 }
 
-void Engine::ExternalFuncCallCompleted(const FuncCall &func_call, std::span<const char> output,
-                                       int32_t processing_time) {
+void
+Engine::ExternalFuncCallCompleted(const FuncCall& func_call,
+                                  std::span<const char> output,
+                                  int32_t processing_time)
+{
     inflight_external_requests_.fetch_add(-1, std::memory_order_relaxed);
-    GatewayMessage message = GatewayMessageHelper::NewFuncCallComplete(func_call, processing_time);
+    GatewayMessage message =
+        GatewayMessageHelper::NewFuncCallComplete(func_call, processing_time);
     message.payload_size = gsl::narrow_cast<uint32_t>(output.size());
     SendGatewayMessage(message, output);
 }
 
-void Engine::ExternalFuncCallFailed(const FuncCall &func_call, int status_code) {
+void
+Engine::ExternalFuncCallFailed(const FuncCall& func_call, int status_code)
+{
     inflight_external_requests_.fetch_add(-1, std::memory_order_relaxed);
-    GatewayMessage message = GatewayMessageHelper::NewFuncCallFailed(func_call, status_code);
+    GatewayMessage message =
+        GatewayMessageHelper::NewFuncCallFailed(func_call, status_code);
     SendGatewayMessage(message);
 }
 
-Dispatcher *Engine::GetOrCreateDispatcher(uint16_t func_id) {
+Dispatcher*
+Engine::GetOrCreateDispatcher(uint16_t func_id)
+{
     absl::MutexLock lk(&mu_);
-    Dispatcher *dispatcher = GetOrCreateDispatcherLocked(func_id);
+    Dispatcher* dispatcher = GetOrCreateDispatcherLocked(func_id);
     return dispatcher;
 }
 
-Dispatcher *Engine::GetOrCreateDispatcherLocked(uint16_t func_id) {
+Dispatcher*
+Engine::GetOrCreateDispatcherLocked(uint16_t func_id)
+{
     if (dispatchers_.contains(func_id)) {
         return dispatchers_[func_id].get();
     }
@@ -563,19 +666,23 @@ Dispatcher *Engine::GetOrCreateDispatcherLocked(uint16_t func_id) {
     }
 }
 
-void Engine::DiscardFuncCall(const FuncCall &func_call) {
+void
+Engine::DiscardFuncCall(const FuncCall& func_call)
+{
     absl::MutexLock lk(&mu_);
     discarded_func_calls_.push_back(func_call);
     discarded_func_call_stat_.Tick();
 }
 
-void Engine::ProcessDiscardedFuncCallIfNecessary() {
+void
+Engine::ProcessDiscardedFuncCallIfNecessary()
+{
     std::vector<std::unique_ptr<ipc::ShmRegion>> discarded_input_regions;
     std::vector<FuncCall> discarded_external_func_calls;
     std::vector<FuncCall> discarded_internal_func_calls;
     {
         absl::MutexLock lk(&mu_);
-        for (const FuncCall &func_call : discarded_func_calls_) {
+        for (const FuncCall& func_call: discarded_func_calls_) {
             if (func_call.client_id == 0) {
                 std::unique_ptr<ipc::ShmRegion> shm_input = nullptr;
                 GrabFromMap(external_func_call_shm_inputs_, func_call, &shm_input);
@@ -589,17 +696,19 @@ void Engine::ProcessDiscardedFuncCallIfNecessary() {
         }
         discarded_func_calls_.clear();
     }
-    for (const FuncCall &func_call : discarded_external_func_calls) {
+    for (const FuncCall& func_call: discarded_external_func_calls) {
         ExternalFuncCallFailed(func_call);
     }
     if (!discarded_internal_func_calls.empty()) {
         char pipe_buf[PIPE_BUF];
         Message dummy_message;
-        for (const FuncCall &func_call : discarded_internal_func_calls) {
+        for (const FuncCall& func_call: discarded_internal_func_calls) {
             if (use_fifo_for_nested_call_) {
-                worker_lib::FifoFuncCallFinished(func_call, /* success= */ false,
+                worker_lib::FifoFuncCallFinished(func_call,
+                                                 /* success= */ false,
                                                  /* output= */ EMPTY_CHAR_SPAN,
-                                                 /* processing_time= */ 0, pipe_buf,
+                                                 /* processing_time= */ 0,
+                                                 pipe_buf,
                                                  &dummy_message);
             } else {
                 // TODO: handle this case
@@ -609,34 +718,50 @@ void Engine::ProcessDiscardedFuncCallIfNecessary() {
     }
 }
 
-void Engine::CreateGatewayIngressConn(int sockfd) {
-    auto connection =
-        std::make_unique<IngressConnection>(kGatewayIngressTypeId, sockfd, sizeof(GatewayMessage));
-    connection->SetMessageFullSizeCallback(&IngressConnection::GatewayMessageFullSizeCallback);
-    connection->SetNewMessageCallback(IngressConnection::BuildNewGatewayMessageCallback(
-        absl::bind_front(&Engine::OnRecvGatewayMessage, this)));
-    RegisterConnection(PickIOWorkerForConnType(connection->type()), connection.get());
+void
+Engine::CreateGatewayIngressConn(int sockfd)
+{
+    auto connection = std::make_unique<IngressConnection>(kGatewayIngressTypeId,
+                                                          sockfd,
+                                                          sizeof(GatewayMessage));
+    connection->SetMessageFullSizeCallback(
+        &IngressConnection::GatewayMessageFullSizeCallback);
+    connection->SetNewMessageCallback(
+        IngressConnection::BuildNewGatewayMessageCallback(
+            absl::bind_front(&Engine::OnRecvGatewayMessage, this)));
+    RegisterConnection(PickIOWorkerForConnType(connection->type()),
+                       connection.get());
     DCHECK_GE(connection->id(), 0);
     DCHECK(!gateway_ingress_conns_.contains(connection->id()));
     gateway_ingress_conns_[connection->id()] = std::move(connection);
 }
 
-void Engine::CreateSharedLogIngressConn(int sockfd, protocol::ConnType type, uint16_t src_node_id) {
+void
+Engine::CreateSharedLogIngressConn(int sockfd,
+                                   protocol::ConnType type,
+                                   uint16_t src_node_id)
+{
     int conn_type_id = ServerBase::GetIngressConnTypeId(type, src_node_id);
-    auto connection =
-        std::make_unique<IngressConnection>(conn_type_id, sockfd, sizeof(SharedLogMessage));
-    connection->SetMessageFullSizeCallback(&IngressConnection::SharedLogMessageFullSizeCallback);
-    connection->SetNewMessageCallback(IngressConnection::BuildNewSharedLogMessageCallback(
-        absl::bind_front(&log::EngineBase::OnRecvSharedLogMessage,
-                         DCHECK_NOTNULL(shared_log_engine_.get()),
-                         conn_type_id & kConnectionTypeMask, src_node_id)));
+    auto connection = std::make_unique<IngressConnection>(conn_type_id,
+                                                          sockfd,
+                                                          sizeof(SharedLogMessage));
+    connection->SetMessageFullSizeCallback(
+        &IngressConnection::SharedLogMessageFullSizeCallback);
+    connection->SetNewMessageCallback(
+        IngressConnection::BuildNewSharedLogMessageCallback(
+            absl::bind_front(&log::EngineBase::OnRecvSharedLogMessage,
+                             DCHECK_NOTNULL(shared_log_engine_.get()),
+                             conn_type_id & kConnectionTypeMask,
+                             src_node_id)));
     RegisterConnection(PickIOWorkerForConnType(conn_type_id), connection.get());
     DCHECK_GE(connection->id(), 0);
     DCHECK(!ingress_conns_.contains(connection->id()));
     ingress_conns_[connection->id()] = std::move(connection);
 }
 
-void Engine::OnRemoteMessageConn(const protocol::HandshakeMessage &handshake, int sockfd) {
+void
+Engine::OnRemoteMessageConn(const protocol::HandshakeMessage& handshake, int sockfd)
+{
     protocol::ConnType type = static_cast<protocol::ConnType>(handshake.conn_type);
     switch (type) {
     case protocol::ConnType::GATEWAY_TO_ENGINE:
@@ -656,45 +781,63 @@ void Engine::OnRemoteMessageConn(const protocol::HandshakeMessage &handshake, in
     }
 }
 
-void Engine::OnNewLocalIpcConn(int sockfd) {
+void
+Engine::OnNewLocalIpcConn(int sockfd)
+{
     std::shared_ptr<ConnectionBase> connection(new MessageConnection(this, sockfd));
-    RegisterConnection(PickIOWorkerForConnType(connection->type()), connection.get());
+    RegisterConnection(PickIOWorkerForConnType(connection->type()),
+                       connection.get());
     DCHECK_GE(connection->id(), 0);
     DCHECK(!message_connections_.contains(connection->id()));
     message_connections_[connection->id()] = std::move(connection);
 }
 
-bool Engine::SendSharedLogMessage(protocol::ConnType conn_type, uint16_t dst_node_id,
-                                  const SharedLogMessage &message, std::span<const char> payload1,
-                                  std::span<const char> payload2, std::span<const char> payload3) {
-    DCHECK_EQ(size_t{message.payload_size}, payload1.size() + payload2.size() + payload3.size());
-    EgressHub *hub = CurrentIOWorkerChecked()->PickOrCreateConnection<EgressHub>(
+bool
+Engine::SendSharedLogMessage(protocol::ConnType conn_type,
+                             uint16_t dst_node_id,
+                             const SharedLogMessage& message,
+                             std::span<const char> payload1,
+                             std::span<const char> payload2,
+                             std::span<const char> payload3)
+{
+    DCHECK_EQ(size_t{message.payload_size},
+              payload1.size() + payload2.size() + payload3.size());
+    EgressHub* hub = CurrentIOWorkerChecked()->PickOrCreateConnection<EgressHub>(
         ServerBase::GetEgressHubTypeId(conn_type, dst_node_id),
         absl::bind_front(&Engine::CreateEgressHub, this, conn_type, dst_node_id));
     if (hub == nullptr) {
         return false;
     }
-    std::span<const char> data(reinterpret_cast<const char *>(&message), sizeof(SharedLogMessage));
+    std::span<const char> data(reinterpret_cast<const char*>(&message),
+                               sizeof(SharedLogMessage));
     hub->SendMessage(data, payload1, payload2, payload3);
     return true;
 }
 
-EgressHub *Engine::CreateEgressHub(protocol::ConnType conn_type, uint16_t dst_node_id,
-                                   IOWorker *io_worker) {
+EgressHub*
+Engine::CreateEgressHub(protocol::ConnType conn_type,
+                        uint16_t dst_node_id,
+                        IOWorker* io_worker)
+{
     struct sockaddr_in addr;
-    if (!node_watcher()->GetNodeAddr(NodeWatcher::GetDstNodeType(conn_type), dst_node_id, &addr)) {
+    if (!node_watcher()->GetNodeAddr(NodeWatcher::GetDstNodeType(conn_type),
+                                     dst_node_id,
+                                     &addr))
+    {
         return nullptr;
     }
-    auto egress_hub =
-        std::make_unique<EgressHub>(ServerBase::GetEgressHubTypeId(conn_type, dst_node_id), &addr,
-                                    absl::GetFlag(FLAGS_message_conn_per_worker));
+    auto egress_hub = std::make_unique<EgressHub>(
+        ServerBase::GetEgressHubTypeId(conn_type, dst_node_id),
+        &addr,
+        absl::GetFlag(FLAGS_message_conn_per_worker));
     uint16_t src_node_id = node_id_;
-    egress_hub->SetHandshakeMessageCallback([conn_type, src_node_id](std::string *handshake) {
-        *handshake = protocol::EncodeHandshakeMessage(conn_type, src_node_id);
-    });
+    egress_hub->SetHandshakeMessageCallback(
+        [conn_type, src_node_id](std::string* handshake) {
+            *handshake = protocol::EncodeHandshakeMessage(conn_type, src_node_id);
+        });
     RegisterConnection(io_worker, egress_hub.get());
     DCHECK_GE(egress_hub->id(), 0);
-    EgressHub *hub = egress_hub.get();
+    EgressHub* hub = egress_hub.get();
     {
         absl::MutexLock lk(&conn_mu_);
         DCHECK(!egress_hubs_.contains(egress_hub->id()));
@@ -703,5 +846,4 @@ EgressHub *Engine::CreateEgressHub(protocol::ConnType conn_type, uint16_t dst_no
     return hub;
 }
 
-} // namespace engine
-} // namespace faas
+}} // namespace faas::engine

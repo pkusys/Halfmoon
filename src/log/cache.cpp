@@ -1,33 +1,36 @@
 #include "log/cache.h"
+#include "log/utils.h"
 
 __BEGIN_THIRD_PARTY_HEADERS
 #include <tkrzw_dbm_cache.h>
 __END_THIRD_PARTY_HEADERS
 
-namespace faas {
-namespace log {
+namespace faas { namespace log {
 
-LRUCache::LRUCache(int mem_cap_mb, bool prefetch) : prefetch_(prefetch) {
+LRUCache::LRUCache(int mem_cap_mb)
+{
     int64_t cap_mem_size = -1;
     if (mem_cap_mb > 0) {
         cap_mem_size = int64_t{mem_cap_mb} << 20;
     }
-    VLOG(1) << fmt::format("build cache with prefetch={}", prefetch_);
     dbm_.reset(new tkrzw::CacheDBM(/* cap_rec_num= */ -1, cap_mem_size));
 }
 
 LRUCache::~LRUCache() {}
 
 namespace {
-static inline std::string EncodeLogEntry(const LogMetaData &log_metadata,
-                                         std::span<const uint64_t> user_tags,
-                                         std::span<const char> log_data) {
+static inline std::string
+EncodeLogEntry(const LogMetaData& log_metadata,
+               std::span<const uint64_t> user_tags,
+               std::span<const char> log_data)
+{
     DCHECK_EQ(log_metadata.num_tags, user_tags.size());
     DCHECK_EQ(log_metadata.data_size, log_data.size());
-    size_t total_size = log_data.size() + user_tags.size() * sizeof(uint64_t) + sizeof(LogMetaData);
+    size_t total_size =
+        log_data.size() + user_tags.size() * sizeof(uint64_t) + sizeof(LogMetaData);
     std::string encoded;
     encoded.resize(total_size);
-    char *ptr = encoded.data();
+    char* ptr = encoded.data();
     DCHECK_GT(log_data.size(), 0U);
     memcpy(ptr, log_data.data(), log_data.size());
     ptr += log_data.size();
@@ -39,16 +42,20 @@ static inline std::string EncodeLogEntry(const LogMetaData &log_metadata,
     return encoded;
 }
 
-static inline void DecodeLogEntry(std::string encoded, LogEntry *log_entry) {
+static inline void
+DecodeLogEntry(std::string encoded, LogEntry* log_entry)
+{
     DCHECK_GT(encoded.size(), sizeof(LogMetaData));
-    LogMetaData &metadata = log_entry->metadata;
-    memcpy(&metadata, encoded.data() + encoded.size() - sizeof(LogMetaData), sizeof(LogMetaData));
-    size_t total_size =
-        metadata.data_size + metadata.num_tags * sizeof(uint64_t) + sizeof(LogMetaData);
+    LogMetaData& metadata = log_entry->metadata;
+    memcpy(&metadata,
+           encoded.data() + encoded.size() - sizeof(LogMetaData),
+           sizeof(LogMetaData));
+    size_t total_size = metadata.data_size + metadata.num_tags * sizeof(uint64_t) +
+                        sizeof(LogMetaData);
     DCHECK_EQ(total_size, encoded.size());
     if (metadata.num_tags > 0) {
         std::span<const uint64_t> user_tags(
-            reinterpret_cast<const uint64_t *>(encoded.data() + metadata.data_size),
+            reinterpret_cast<const uint64_t*>(encoded.data() + metadata.data_size),
             metadata.num_tags);
         log_entry->user_tags.assign(user_tags.begin(), user_tags.end());
     } else {
@@ -59,14 +66,66 @@ static inline void DecodeLogEntry(std::string encoded, LogEntry *log_entry) {
 }
 } // namespace
 
-void LRUCache::Put(const LogMetaData &log_metadata, std::span<const uint64_t> user_tags,
-                   std::span<const char> log_data) {
+void
+LRUCache::CCPut(CCLogEntry* cc_entry)
+{
+    std::string encoded;
+    log_utils::EncodeCCLogEntry(&encoded, cc_entry);
+    std::string key_str =
+        fmt::format("0_{:016x}", cc_entry->common_header.txn_localid);
+    dbm_->Set(key_str, encoded, /* overwrite= */ true);
+}
+
+std::optional<CCLogEntry>
+LRUCache::CCGet(uint64_t txn_localid)
+{
+    std::string key_str = fmt::format("0_{:016x}", txn_localid);
+    std::string encoded;
+    if (dbm_->Get(key_str, &encoded) != tkrzw::Status::SUCCESS) {
+        return std::nullopt;
+    }
+    CCLogEntry cc_entry;
+    log_utils::DecodeCCLogEntry(&cc_entry, std::move(encoded));
+    return cc_entry;
+}
+
+void
+LRUCache::CCPutAuxData(uint64_t global_batch_id,
+                       uint64_t key,
+                       std::span<const char> aux_data)
+{
+    std::string key_str = fmt::format("{:016x}_{:016x}", global_batch_id, key);
+    // VLOG(1) << fmt::format("put aux data with key={}", key_str);
+    dbm_->Set(key_str,
+              std::string(aux_data.data(), aux_data.size()),
+              /* overwrite= */ true);
+}
+
+std::optional<std::string>
+LRUCache::CCGetAuxData(uint64_t global_batch_id, uint64_t key)
+{
+    std::string key_str = fmt::format("{:016x}_{:016x}", global_batch_id, key);
+    // VLOG(1) << fmt::format("get aux data with key={}", key_str);
+    std::string aux_data;
+    if (dbm_->Get(key_str, &aux_data) != tkrzw::Status::SUCCESS) {
+        return std::nullopt;
+    }
+    return aux_data;
+}
+
+void
+LRUCache::Put(const LogMetaData& log_metadata,
+              std::span<const uint64_t> user_tags,
+              std::span<const char> log_data)
+{
     std::string key_str = fmt::format("0_{:016x}", log_metadata.seqnum);
     std::string data = EncodeLogEntry(log_metadata, user_tags, log_data);
     dbm_->Set(key_str, data, /* overwrite= */ false);
 }
 
-std::optional<LogEntry> LRUCache::Get(uint64_t seqnum) {
+std::optional<LogEntry>
+LRUCache::Get(uint64_t seqnum)
+{
     std::string key_str = fmt::format("0_{:016x}", seqnum);
     std::string data;
     auto status = dbm_->Get(key_str, &data);
@@ -75,24 +134,23 @@ std::optional<LogEntry> LRUCache::Get(uint64_t seqnum) {
         DecodeLogEntry(std::move(data), &log_entry);
         DCHECK_EQ(seqnum, log_entry.metadata.seqnum);
         return log_entry;
-    } else if (prefetch_) {
-        VLOG_F(1, "return fake cache at seqnum({:#x})", seqnum);
-        LogEntry log_entry;
-        memset(static_cast<void *>(&log_entry), 0, sizeof(LogEntry));
-        log_entry.metadata.seqnum = seqnum;
-        return log_entry;
     } else {
         return std::nullopt;
     }
 }
 
-void LRUCache::PutAuxData(uint64_t seqnum, std::span<const char> data) {
+void
+LRUCache::PutAuxData(uint64_t seqnum, std::span<const char> data)
+{
     std::string key_str = fmt::format("1_{:016x}", seqnum);
-    dbm_->Set(key_str, std::string_view(data.data(), data.size()),
+    dbm_->Set(key_str,
+              std::string_view(data.data(), data.size()),
               /* overwrite= */ true);
 }
 
-std::optional<std::string> LRUCache::GetAuxData(uint64_t seqnum) {
+std::optional<std::string>
+LRUCache::GetAuxData(uint64_t seqnum)
+{
     std::string key_str = fmt::format("1_{:016x}", seqnum);
     std::string data;
     auto status = dbm_->Get(key_str, &data);
@@ -103,5 +161,4 @@ std::optional<std::string> LRUCache::GetAuxData(uint64_t seqnum) {
     }
 }
 
-} // namespace log
-} // namespace faas
+}} // namespace faas::log

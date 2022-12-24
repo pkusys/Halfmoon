@@ -6,8 +6,7 @@
 #include "utils/object_pool.h"
 #include "utils/bits.h"
 
-namespace faas {
-namespace log {
+namespace faas { namespace log {
 
 class LogSpaceBase {
 public:
@@ -15,10 +14,14 @@ public:
 
     uint16_t view_id() const { return view_->id(); }
     uint16_t sequencer_id() const { return sequencer_node_->node_id(); }
-    uint32_t identifier() const { return bits::JoinTwo16(view_id(), sequencer_id()); }
+    uint32_t identifier() const
+    {
+        return bits::JoinTwo16(view_id(), sequencer_id());
+    }
 
     uint32_t metalog_position() const { return metalog_position_; }
-    uint64_t seqnum_position() const {
+    uint64_t seqnum_position() const
+    {
         return bits::JoinTwo32(identifier(), seqnum_position_);
     }
 
@@ -36,6 +39,12 @@ public:
 
     void SerializeToProto(MetaLogsProto* meta_logs_proto);
 
+    utils::ProtobufMessagePool<CCGlobalBatchProto> global_batch_proto_pool_;
+    // std::vector<MetaLogProto*> applied_metalogs_;
+    std::map</* metalog_seqnum */ uint32_t, CCGlobalBatchProto*>
+        pending_global_batches_;
+    uint32_t global_batch_position_;
+
 protected:
     enum Mode { kLiteMode, kFullMode };
     enum State { kCreated, kNormal, kFrozen, kFinalized };
@@ -45,13 +54,17 @@ protected:
 
     using OffsetVec = absl::FixedArray<uint32_t>;
     virtual void OnNewLogs(uint32_t metalog_seqnum,
-                           uint64_t start_seqnum, uint64_t start_localid,
-                           uint32_t delta) {}
+                           uint64_t start_seqnum,
+                           uint64_t start_localid,
+                           uint32_t delta)
+    {}
     virtual void OnTrim(uint32_t metalog_seqnum,
-                        uint32_t user_logspace, uint64_t user_tag,
-                        uint64_t trim_seqnum) {}
+                        uint32_t user_logspace,
+                        uint64_t user_tag,
+                        uint64_t trim_seqnum)
+    {}
     virtual void OnMetaLogApplied(const MetaLogProto& meta_log_proto) {}
-    virtual void OnFinalized(uint32_t metalog_position) {} 
+    virtual void OnFinalized(uint32_t metalog_position) {}
 
     Mode mode_;
     State state_;
@@ -76,7 +89,7 @@ private:
     DISALLOW_COPY_AND_ASSIGN(LogSpaceBase);
 };
 
-template<class T>
+template <class T>
 class LogSpaceCollection {
 public:
     LogSpaceCollection() {}
@@ -93,7 +106,8 @@ public:
     // Only finalized LogSpace can be removed
     bool RemoveLogSpace(uint32_t identifier);
 
-    using IterCallback = std::function<void(/* identifier */ uint32_t, LockablePtr<T>)>;
+    using IterCallback =
+        std::function<void(/* identifier */ uint32_t, LockablePtr<T>)>;
     void ForEachActiveLogSpace(const View* view, IterCallback cb) const;
     void ForEachActiveLogSpace(IterCallback cb) const;
     void ForEachFinalizedLogSpace(IterCallback cb) const;
@@ -109,8 +123,10 @@ private:
 
 // Start implementation of LogSpaceCollection
 
-template<class T>
-LockablePtr<T> LogSpaceCollection<T>::GetLogSpace(uint32_t identifier) const {
+template <class T>
+LockablePtr<T>
+LogSpaceCollection<T>::GetLogSpace(uint32_t identifier) const
+{
     if (log_spaces_.contains(identifier)) {
         return log_spaces_.at(identifier);
     } else {
@@ -118,24 +134,30 @@ LockablePtr<T> LogSpaceCollection<T>::GetLogSpace(uint32_t identifier) const {
     }
 }
 
-template<class T>
-LockablePtr<T> LogSpaceCollection<T>::GetLogSpaceChecked(uint32_t identifier) const {
+template <class T>
+LockablePtr<T>
+LogSpaceCollection<T>::GetLogSpaceChecked(uint32_t identifier) const
+{
     if (!log_spaces_.contains(identifier)) {
         LOG_F(FATAL, "Cannot find LogSpace with identifier {}", identifier);
     }
     return log_spaces_.at(identifier);
 }
 
-template<class T>
-void LogSpaceCollection<T>::InstallLogSpace(std::unique_ptr<T> log_space) {
+template <class T>
+void
+LogSpaceCollection<T>::InstallLogSpace(std::unique_ptr<T> log_space)
+{
     uint32_t identifier = log_space->identifier();
     DCHECK(active_log_spaces_.count(identifier) == 0);
     active_log_spaces_.insert(identifier);
     log_spaces_[identifier] = LockablePtr<T>(std::move(log_space));
 }
 
-template<class T>
-bool LogSpaceCollection<T>::FinalizeLogSpace(uint32_t identifier) {
+template <class T>
+bool
+LogSpaceCollection<T>::FinalizeLogSpace(uint32_t identifier)
+{
     if (active_log_spaces_.count(identifier) == 0) {
         return false;
     }
@@ -145,8 +167,10 @@ bool LogSpaceCollection<T>::FinalizeLogSpace(uint32_t identifier) {
     return true;
 }
 
-template<class T>
-bool LogSpaceCollection<T>::RemoveLogSpace(uint32_t identifier) {
+template <class T>
+bool
+LogSpaceCollection<T>::RemoveLogSpace(uint32_t identifier)
+{
     if (finalized_log_spaces_.count(identifier) == 0) {
         return false;
     }
@@ -156,8 +180,10 @@ bool LogSpaceCollection<T>::RemoveLogSpace(uint32_t identifier) {
     return true;
 }
 
-template<class T>
-void LogSpaceCollection<T>::ForEachActiveLogSpace(const View* view, IterCallback cb) const {
+template <class T>
+void
+LogSpaceCollection<T>::ForEachActiveLogSpace(const View* view, IterCallback cb) const
+{
     auto iter = active_log_spaces_.lower_bound(bits::JoinTwo16(view->id(), 0));
     while (iter != active_log_spaces_.end()) {
         if (bits::HighHalf32(*iter) > view->id()) {
@@ -169,8 +195,10 @@ void LogSpaceCollection<T>::ForEachActiveLogSpace(const View* view, IterCallback
     }
 }
 
-template<class T>
-void LogSpaceCollection<T>::ForEachActiveLogSpace(IterCallback cb) const {
+template <class T>
+void
+LogSpaceCollection<T>::ForEachActiveLogSpace(IterCallback cb) const
+{
     auto iter = active_log_spaces_.begin();
     while (iter != active_log_spaces_.end()) {
         DCHECK(log_spaces_.contains(*iter));
@@ -179,8 +207,10 @@ void LogSpaceCollection<T>::ForEachActiveLogSpace(IterCallback cb) const {
     }
 }
 
-template<class T>
-void LogSpaceCollection<T>::ForEachFinalizedLogSpace(IterCallback cb) const {
+template <class T>
+void
+LogSpaceCollection<T>::ForEachFinalizedLogSpace(IterCallback cb) const
+{
     auto iter = finalized_log_spaces_.begin();
     while (iter != finalized_log_spaces_.end()) {
         DCHECK(log_spaces_.contains(*iter));
@@ -189,5 +219,4 @@ void LogSpaceCollection<T>::ForEachFinalizedLogSpace(IterCallback cb) const {
     }
 }
 
-}  // namespace log
-}  // namespace faas
+}} // namespace faas::log

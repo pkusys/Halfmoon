@@ -3,18 +3,27 @@
 #include "common/flags.h"
 #include "server/constants.h"
 
-namespace faas {
-namespace server {
+namespace faas { namespace server {
 
-EgressHub::EgressHub(int type, const struct sockaddr_in *addr, size_t num_conn)
-    : ConnectionBase(type), io_worker_(nullptr), state_(kCreated), sockfds_(num_conn, -1),
-      log_header_(GetLogHeader(type)), send_fn_scheduled_(false) {
+EgressHub::EgressHub(int type, const struct sockaddr_in* addr, size_t num_conn)
+    : ConnectionBase(type),
+      io_worker_(nullptr),
+      state_(kCreated),
+      sockfds_(num_conn, -1),
+      log_header_(GetLogHeader(type)),
+      send_fn_scheduled_(false)
+{
     memcpy(&addr_, addr, sizeof(struct sockaddr_in));
 }
 
-EgressHub::~EgressHub() { DCHECK(state_ == kCreated || state_ == kClosed); }
+EgressHub::~EgressHub()
+{
+    DCHECK(state_ == kCreated || state_ == kClosed);
+}
 
-void EgressHub::Start(IOWorker *io_worker) {
+void
+EgressHub::Start(IOWorker* io_worker)
+{
     DCHECK(state_ == kCreated);
     DCHECK(io_worker->WithinMyEventLoopThread());
     HVLOG(1) << fmt::format("starting egress conn type {:#x} id {}", type(), id());
@@ -25,20 +34,24 @@ void EgressHub::Start(IOWorker *io_worker) {
         sockfds_[i] = sockfd;
         URING_DCHECK_OK(current_io_uring()->RegisterFd(sockfd));
         URING_DCHECK_OK(current_io_uring()->Connect(
-            sockfd, reinterpret_cast<struct sockaddr *>(&addr_), sizeof(addr_),
+            sockfd,
+            reinterpret_cast<struct sockaddr*>(&addr_),
+            sizeof(addr_),
             absl::bind_front(&EgressHub::OnSocketConnected, this, sockfd)));
     }
     state_ = kRunning;
 }
 
-void EgressHub::ScheduleClose() {
+void
+EgressHub::ScheduleClose()
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (state_ == kClosing) {
         HLOG(WARNING) << "Already scheduled for closing";
         return;
     }
     DCHECK(state_ == kRunning);
-    for (int sockfd : sockfds_) {
+    for (int sockfd: sockfds_) {
         if (sockfd >= 0) {
             RemoveSocket(sockfd);
         }
@@ -46,15 +59,22 @@ void EgressHub::ScheduleClose() {
     state_ = kClosing;
 }
 
-void EgressHub::SetHandshakeMessageCallback(HandshakeMessageCallback cb) {
+void
+EgressHub::SetHandshakeMessageCallback(HandshakeMessageCallback cb)
+{
     handshake_message_cb_ = cb;
 }
 
-void EgressHub::SendMessage(std::span<const char> part1, std::span<const char> part2,
-                            std::span<const char> part3, std::span<const char> part4) {
+void
+EgressHub::SendMessage(std::span<const char> part1,
+                       std::span<const char> part2,
+                       std::span<const char> part3,
+                       std::span<const char> part4)
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (state_ != kRunning) {
-        HLOG(ERROR) << "Connection is closing or has closed, will not send this message";
+        HLOG(ERROR)
+            << "Connection is closing or has closed, will not send this message";
         return;
     }
     if (part1.size() + part2.size() + part3.size() + part4.size() == 0) {
@@ -68,21 +88,28 @@ void EgressHub::SendMessage(std::span<const char> part1, std::span<const char> p
 }
 
 namespace {
-static std::span<const char> CopyToBuffer(std::span<char> buf, std::span<const char> data) {
+static std::span<const char>
+CopyToBuffer(std::span<char> buf, std::span<const char> data)
+{
     DCHECK_LE(data.size(), buf.size());
     memcpy(buf.data(), data.data(), data.size());
     return std::span<const char>(buf.data(), data.size());
 }
 } // namespace
 
-void EgressHub::OnSocketConnected(int sockfd, int status) {
+void
+EgressHub::OnSocketConnected(int sockfd, int status)
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (status != 0) {
         HPLOG(ERROR) << "Failed to connect";
         RemoveSocket(sockfd);
         return;
     }
-    HVLOG(1) << fmt::format("egress type {} id {} sock {} connected", type(), id(), sockfd);
+    HVLOG(1) << fmt::format("egress type {:#x} id {} sock {} connected",
+                            type(),
+                            id(),
+                            sockfd);
     if (absl::GetFlag(FLAGS_tcp_enable_nodelay)) {
         CHECK(utils::SetTcpSocketNoDelay(sockfd));
     }
@@ -91,7 +118,9 @@ void EgressHub::OnSocketConnected(int sockfd, int status) {
     }
     // Setup Recv helps to detect disconnection from the other end
     URING_DCHECK_OK(current_io_uring()->StartRecv(
-        sockfd, kOctaBufGroup, [this, sockfd](int status, std::span<const char> data) -> bool {
+        sockfd,
+        kOctaBufGroup,
+        [this, sockfd](int status, std::span<const char> data) -> bool {
             if (status != 0) {
                 HPLOG(ERROR) << "Read error, will close this connection";
                 RemoveSocket(sockfd);
@@ -118,7 +147,9 @@ void EgressHub::OnSocketConnected(int sockfd, int status) {
     io_worker_->NewWriteBuffer(&buf);
     CHECK_LE(handshake.size(), buf.size());
     URING_DCHECK_OK(current_io_uring()->SendAll(
-        sockfd, CopyToBuffer(buf, STRING_AS_SPAN(handshake)), [this, sockfd, buf](int status) {
+        sockfd,
+        CopyToBuffer(buf, STRING_AS_SPAN(handshake)),
+        [this, sockfd, buf](int status) {
             io_worker_->ReturnWriteBuffer(buf);
             if (status != 0) {
                 HPLOG(ERROR) << "Failed to send handshake";
@@ -129,7 +160,9 @@ void EgressHub::OnSocketConnected(int sockfd, int status) {
         }));
 }
 
-void EgressHub::SocketReady(int sockfd) {
+void
+EgressHub::SocketReady(int sockfd)
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     HLOG_F(INFO, "Socket {} is ready", sockfd);
     connections_for_pick_.Add(sockfd);
@@ -138,7 +171,9 @@ void EgressHub::SocketReady(int sockfd) {
     }
 }
 
-void EgressHub::RemoveSocket(int sockfd) {
+void
+EgressHub::RemoveSocket(int sockfd)
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     HLOG_F(INFO, "Socket {} is down", sockfd);
     connections_for_pick_.Remove(sockfd);
@@ -158,20 +193,26 @@ void EgressHub::RemoveSocket(int sockfd) {
     }));
 }
 
-void EgressHub::ScheduleSendFunction() {
+void
+EgressHub::ScheduleSendFunction()
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     DCHECK(!write_buffer_.empty());
     if (!send_fn_scheduled_) {
-        io_worker_->ScheduleIdleFunction(this,
-                                         absl::bind_front(&EgressHub::SendPendingMessages, this));
+        io_worker_->ScheduleIdleFunction(
+            this,
+            absl::bind_front(&EgressHub::SendPendingMessages, this));
         send_fn_scheduled_ = true;
     }
 }
 
-void EgressHub::SendPendingMessages() {
+void
+EgressHub::SendPendingMessages()
+{
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (state_ != kRunning) {
-        HLOG(ERROR) << "Connection is closing or has closed, will not send this message";
+        HLOG(ERROR)
+            << "Connection is closing or has closed, will not send this message";
         return;
     }
     DCHECK(send_fn_scheduled_);
@@ -190,19 +231,23 @@ void EgressHub::SendPendingMessages() {
         io_worker_->NewWriteBuffer(&buf);
         size_t copy_size = std::min(buf.size(), write_buffer_.length());
         std::span<const char> data(write_buffer_.data(), copy_size);
-        URING_DCHECK_OK(current_io_uring()->SendAll(sockfd, CopyToBuffer(buf, data),
-                                                    [this, buf, sockfd](int status) {
-                                                        io_worker_->ReturnWriteBuffer(buf);
-                                                        if (status != 0) {
-                                                            HPLOG(ERROR) << "Failed to send data";
-                                                            RemoveSocket(sockfd);
-                                                        }
-                                                    }));
+        URING_DCHECK_OK(current_io_uring()->SendAll(
+            sockfd,
+            CopyToBuffer(buf, data),
+            [this, buf, sockfd](int status) {
+                io_worker_->ReturnWriteBuffer(buf);
+                if (status != 0) {
+                    HPLOG(ERROR) << "Failed to send data";
+                    RemoveSocket(sockfd);
+                }
+            }));
         write_buffer_.ConsumeFront(copy_size);
     }
 }
 
-std::string EgressHub::GetLogHeader(int type) {
+std::string
+EgressHub::GetLogHeader(int type)
+{
     int masked_type = type & kConnectionTypeMask;
     switch (masked_type) {
     case kGatewayEgressHubTypeId:
@@ -218,5 +263,4 @@ std::string EgressHub::GetLogHeader(int type) {
     }
 }
 
-} // namespace server
-} // namespace faas
+}} // namespace faas::server

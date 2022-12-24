@@ -3,20 +3,24 @@
 #include "ipc/base.h"
 #include "ipc/fifo.h"
 #include "engine/engine.h"
+#include "server/io_worker.h"
 
 #define log_header_ "WorkerManager: "
 
-namespace faas {
-namespace engine {
+namespace faas { namespace engine {
 
 using protocol::Message;
 
 WorkerManager::WorkerManager(Engine* engine)
-    : engine_(engine), next_client_id_(1) {}
+    : engine_(engine),
+      next_client_id_(1)
+{}
 
 WorkerManager::~WorkerManager() {}
 
-bool WorkerManager::OnLauncherConnected(MessageConnection* launcher_connection) {
+bool
+WorkerManager::OnLauncherConnected(MessageConnection* launcher_connection)
+{
     uint16_t func_id = launcher_connection->func_id();
     HLOG_F(INFO, "Launcher of func_id {} connected", func_id);
     {
@@ -27,7 +31,8 @@ bool WorkerManager::OnLauncherConnected(MessageConnection* launcher_connection) 
         }
         launcher_connections_[func_id] = launcher_connection->ref_self();
     }
-    const FuncConfig::Entry* func_entry = engine_->func_config()->find_by_func_id(func_id);
+    const FuncConfig::Entry* func_entry =
+        engine_->func_config()->find_by_func_id(func_id);
     DCHECK(func_entry != nullptr);
     int min_workers = func_entry->min_workers;
     if (min_workers == -1) {
@@ -40,22 +45,31 @@ bool WorkerManager::OnLauncherConnected(MessageConnection* launcher_connection) 
     return true;
 }
 
-void WorkerManager::OnLauncherDisconnected(MessageConnection* launcher_connection) {
+void
+WorkerManager::OnLauncherDisconnected(MessageConnection* launcher_connection)
+{
     uint16_t func_id = launcher_connection->func_id();
     HLOG_F(INFO, "Launcher of func_id {} disconnected", func_id);
     absl::MutexLock lk(&mu_);
-    if (launcher_connections_.contains(func_id)
-          && launcher_connections_[func_id]->as_ptr<MessageConnection>() == launcher_connection) {
+    if (launcher_connections_.contains(func_id) &&
+        launcher_connections_[func_id]->as_ptr<MessageConnection>() ==
+            launcher_connection)
+    {
         launcher_connections_.erase(func_id);
     } else {
         HLOG_F(ERROR, "Cannot find launcher connection for func_id {}", func_id);
     }
 }
 
-bool WorkerManager::OnFuncWorkerConnected(MessageConnection* worker_connection) {
+bool
+WorkerManager::OnFuncWorkerConnected(MessageConnection* worker_connection)
+{
     uint16_t func_id = worker_connection->func_id();
     uint16_t client_id = worker_connection->client_id();
-    HLOG_F(INFO, "FuncWorker of func_id {}, client_id {} connected", func_id, client_id);
+    HLOG_F(INFO,
+           "FuncWorker of func_id {}, client_id {} connected",
+           func_id,
+           client_id);
     std::shared_ptr<FuncWorker> func_worker;
     {
         absl::MutexLock lk(&mu_);
@@ -75,10 +89,15 @@ bool WorkerManager::OnFuncWorkerConnected(MessageConnection* worker_connection) 
     return true;
 }
 
-void WorkerManager::OnFuncWorkerDisconnected(MessageConnection* worker_connection) {
+void
+WorkerManager::OnFuncWorkerDisconnected(MessageConnection* worker_connection)
+{
     uint16_t func_id = worker_connection->func_id();
     uint16_t client_id = worker_connection->client_id();
-    HLOG_F(INFO, "FuncWorker of func_id {}, client_id {} disconnected", func_id, client_id);
+    HLOG_F(INFO,
+           "FuncWorker of func_id {}, client_id {} disconnected",
+           func_id,
+           client_id);
     std::shared_ptr<FuncWorker> func_worker;
     {
         absl::MutexLock lk(&mu_);
@@ -97,7 +116,9 @@ void WorkerManager::OnFuncWorkerDisconnected(MessageConnection* worker_connectio
     ipc::FifoRemove(ipc::GetFuncWorkerOutputFifoName(client_id));
 }
 
-bool WorkerManager::RequestNewFuncWorker(uint16_t func_id, uint16_t* client_id) {
+bool
+WorkerManager::RequestNewFuncWorker(uint16_t func_id, uint16_t* client_id)
+{
     std::shared_ptr<server::ConnectionBase> connection;
     {
         absl::MutexLock lk(&mu_);
@@ -107,10 +128,13 @@ bool WorkerManager::RequestNewFuncWorker(uint16_t func_id, uint16_t* client_id) 
         }
         connection = launcher_connections_[func_id];
     }
-    return RequestNewFuncWorkerInternal(connection->as_ptr<MessageConnection>(), client_id);
+    return RequestNewFuncWorkerInternal(connection->as_ptr<MessageConnection>(),
+                                        client_id);
 }
 
-std::shared_ptr<FuncWorker> WorkerManager::GetFuncWorker(uint16_t client_id) {
+std::shared_ptr<FuncWorker>
+WorkerManager::GetFuncWorker(uint16_t client_id)
+{
     absl::MutexLock lk(&mu_);
     if (!func_workers_.contains(client_id)) {
         HLOG_F(WARNING, "FuncWorker of client_id {} does not exist", client_id);
@@ -120,12 +144,17 @@ std::shared_ptr<FuncWorker> WorkerManager::GetFuncWorker(uint16_t client_id) {
     }
 }
 
-bool WorkerManager::RequestNewFuncWorkerInternal(MessageConnection* launcher_connection,
-                                                 uint16_t* out_client_id) {
+bool
+WorkerManager::RequestNewFuncWorkerInternal(MessageConnection* launcher_connection,
+                                            uint16_t* out_client_id)
+{
     uint16_t client_id = next_client_id_.fetch_add(1, std::memory_order_relaxed);
-    CHECK_LE(client_id, protocol::kMaxClientId) << "Reach maximum number of clients!";
-    HLOG_F(INFO, "Request new FuncWorker for func_id {} with client_id {}",
-           launcher_connection->func_id(), client_id);
+    CHECK_LE(client_id, protocol::kMaxClientId)
+        << "Reach maximum number of clients!";
+    HLOG_F(INFO,
+           "Request new FuncWorker for func_id {} with client_id {}",
+           launcher_connection->func_id(),
+           client_id);
     if (!engine_->func_worker_use_engine_socket()) {
         CHECK(ipc::FifoCreate(ipc::GetFuncWorkerInputFifoName(client_id)))
             << "FifoCreate failed";
@@ -141,14 +170,22 @@ bool WorkerManager::RequestNewFuncWorkerInternal(MessageConnection* launcher_con
 FuncWorker::FuncWorker(MessageConnection* message_connection)
     : func_id_(message_connection->func_id()),
       client_id_(message_connection->client_id()),
-      message_connection_(message_connection->ref_self()) {}
+      message_connection_(message_connection->ref_self())
+{}
 
 FuncWorker::~FuncWorker() {}
 
-void FuncWorker::SendMessage(Message* message) {
+server::IOWorker*
+FuncWorker::GetIOWorker() const
+{
+    return message_connection_->as_ptr<MessageConnection>()->io_worker_;
+}
+
+void
+FuncWorker::SendMessage(Message* message)
+{
     message->send_timestamp = GetMonotonicMicroTimestamp();
     message_connection_->as_ptr<MessageConnection>()->WriteMessage(*message);
 }
 
-}  // namespace engine
-}  // namespace faas
+}} // namespace faas::engine

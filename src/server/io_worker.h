@@ -6,21 +6,26 @@
 #include "utils/round_robin_set.h"
 #include "server/io_uring.h"
 
-namespace faas {
-namespace server {
+namespace faas { namespace server {
 
 class IOWorker;
 
-class ConnectionBase : public std::enable_shared_from_this<ConnectionBase> {
+class ConnectionBase: public std::enable_shared_from_this<ConnectionBase> {
 public:
-    explicit ConnectionBase(int type = -1) : type_(type), id_(-1) {}
+    explicit ConnectionBase(int type = -1)
+        : type_(type),
+          id_(-1)
+    {}
     virtual ~ConnectionBase() {}
 
     int type() const { return type_; }
     int id() const { return id_; }
 
-    template<class T>
-    T* as_ptr() { return static_cast<T*>(this); }
+    template <class T>
+    T* as_ptr()
+    {
+        return static_cast<T*>(this);
+    }
     std::shared_ptr<ConnectionBase> ref_self() { return shared_from_this(); }
 
     virtual void Start(IOWorker* io_worker) = 0;
@@ -44,9 +49,10 @@ private:
 
 class IOWorker final {
 public:
-    IOWorker(std::string_view worker_name, size_t write_buffer_size);
+    IOWorker(int worker_id, std::string_view worker_name, size_t write_buffer_size);
     ~IOWorker();
 
+    size_t worker_id() const { return worker_id_; }
     std::string_view worker_name() const { return worker_name_; }
     IOUring* io_uring() { return &io_uring_; }
 
@@ -69,13 +75,14 @@ public:
     // Pick a connection of given type managed by this IOWorker
     ConnectionBase* PickConnection(int type);
 
-    template<class T>
-    T* PickConnectionAs(int type) {
+    template <class T>
+    T* PickConnectionAs(int type)
+    {
         ConnectionBase* conn = PickConnection(type);
         return conn != nullptr ? conn->as_ptr<T>() : nullptr;
     }
 
-    template<class T>
+    template <class T>
     T* PickOrCreateConnection(int type, std::function<T*(IOWorker*)> create_cb);
 
     // Schedule a function to run on this IO worker's event loop
@@ -91,6 +98,7 @@ public:
 private:
     enum State { kCreated, kRunning, kStopping, kStopped };
 
+    size_t worker_id_;
     std::string worker_name_;
     std::atomic<State> state_;
     IOUring io_uring_;
@@ -104,7 +112,8 @@ private:
     base::Thread event_loop_thread_;
     absl::flat_hash_map</* id */ int, ConnectionBase*> connections_;
     absl::flat_hash_map</* type */ int,
-                        std::unique_ptr<utils::RoundRobinSet</* id */ int>>> connections_by_type_;
+                        std::unique_ptr<utils::RoundRobinSet</* id */ int>>>
+        connections_by_type_;
     utils::BufferPool write_buffer_pool_;
     int connections_on_closing_;
 
@@ -113,8 +122,8 @@ private:
         std::function<void()> fn;
     };
     absl::Mutex scheduled_function_mu_;
-    absl::InlinedVector<ScheduledFunction, 16>
-        scheduled_functions_ ABSL_GUARDED_BY(scheduled_function_mu_);
+    absl::InlinedVector<ScheduledFunction, 16> scheduled_functions_
+        ABSL_GUARDED_BY(scheduled_function_mu_);
     absl::InlinedVector<ScheduledFunction, 16> idle_functions_;
 
     void EventLoopThreadMain();
@@ -127,8 +136,10 @@ private:
     DISALLOW_COPY_AND_ASSIGN(IOWorker);
 };
 
-template<class T>
-T* IOWorker::PickOrCreateConnection(int type, std::function<T*(IOWorker*)> create_cb) {
+template <class T>
+T*
+IOWorker::PickOrCreateConnection(int type, std::function<T*(IOWorker*)> create_cb)
+{
     T* conn = PickConnectionAs<T>(type);
     if (conn != nullptr) {
         return conn;
@@ -142,5 +153,4 @@ T* IOWorker::PickOrCreateConnection(int type, std::function<T*(IOWorker*)> creat
     }
 }
 
-}  // namespace server
-}  // namespace faas
+}} // namespace faas::server

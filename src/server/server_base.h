@@ -8,8 +8,7 @@
 #include "server/node_watcher.h"
 #include "server/timer.h"
 
-namespace faas {
-namespace server {
+namespace faas { namespace server {
 
 class ServerBase {
 public:
@@ -21,6 +20,8 @@ public:
     void Start();
     void ScheduleStop();
     void WaitForFinish();
+
+    size_t num_io_workers() { return io_workers_.size(); }
 
 protected:
     enum State { kCreated, kBootstrapping, kRunning, kStopping, kStopped };
@@ -36,7 +37,10 @@ protected:
     IOWorker* SomeIOWorker() const;
 
     static IOWorker* CurrentIOWorker() { return IOWorker::current(); }
-    static IOWorker* CurrentIOWorkerChecked() { return DCHECK_NOTNULL(IOWorker::current()); }
+    static IOWorker* CurrentIOWorkerChecked()
+    {
+        return DCHECK_NOTNULL(IOWorker::current());
+    }
 
     void RegisterConnection(IOWorker* io_worker, ConnectionBase* connection);
 
@@ -44,7 +48,9 @@ protected:
     void ListenForNewConnections(int server_sockfd, ConnectionCallback cb);
 
     Timer* CreateTimer(int timer_type, IOWorker* io_worker, Timer::Callback cb);
-    void CreatePeriodicTimer(int timer_type, absl::Duration interval, Timer::Callback cb);
+    void CreatePeriodicTimer(int timer_type,
+                             absl::Duration interval,
+                             Timer::Callback cb);
 
     // Supposed to be implemented by sub-class
     virtual void StartInternal() = 0;
@@ -86,5 +92,4 @@ private:
     DISALLOW_COPY_AND_ASSIGN(ServerBase);
 };
 
-}  // namespace server
-}  // namespace faas
+}} // namespace faas::server

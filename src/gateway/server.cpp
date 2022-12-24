@@ -1,6 +1,8 @@
 #include "gateway/server.h"
 
+#include "base/logging.h"
 #include "common/time.h"
+#include "fmt/core.h"
 #include "utils/fs.h"
 #include "utils/io.h"
 #include "utils/base64.h"
@@ -13,8 +15,7 @@
 
 #define log_header_ "Server: "
 
-namespace faas {
-namespace gateway {
+namespace faas { namespace gateway {
 
 using protocol::FuncCall;
 using protocol::FuncCallHelper;
@@ -31,26 +32,36 @@ Server::Server()
       next_grpc_connection_id_(0),
       node_manager_(this),
       next_call_id_(1),
-      background_thread_("BG", absl::bind_front(&Server::BackgroundThreadMain, this)),
+      background_thread_("BG",
+                         absl::bind_front(&Server::BackgroundThreadMain, this)),
       last_request_timestamp_(-1),
       incoming_requests_stat_(
           stat::Counter::StandardReportCallback("incoming_requests")),
       request_interval_stat_(
-          stat::StatisticsCollector<int32_t>::StandardReportCallback("request_interval")),
+          stat::StatisticsCollector<int32_t>::StandardReportCallback(
+              "request_interval")),
       requests_instant_rps_stat_(
-          stat::StatisticsCollector<float>::StandardReportCallback("requests_instant_rps")),
+          stat::StatisticsCollector<float>::StandardReportCallback(
+              "requests_instant_rps")),
       inflight_requests_stat_(
-          stat::StatisticsCollector<uint16_t>::StandardReportCallback("inflight_requests")),
+          stat::StatisticsCollector<uint16_t>::StandardReportCallback(
+              "inflight_requests")),
       running_requests_stat_(
-          stat::StatisticsCollector<uint16_t>::StandardReportCallback("running_requests")),
+          stat::StatisticsCollector<uint16_t>::StandardReportCallback(
+              "running_requests")),
       queueing_delay_stat_(
-          stat::StatisticsCollector<int32_t>::StandardReportCallback("queueing_delay")),
+          stat::StatisticsCollector<int32_t>::StandardReportCallback(
+              "queueing_delay")),
       dispatch_overhead_stat_(
-          stat::StatisticsCollector<int32_t>::StandardReportCallback("dispatch_overhead")) {}
+          stat::StatisticsCollector<int32_t>::StandardReportCallback(
+              "dispatch_overhead"))
+{}
 
 Server::~Server() {}
 
-void Server::StartInternal() {
+void
+Server::StartInternal()
+{
     // Load function config file
     std::string func_config_json;
     CHECK(!func_config_file_.empty());
@@ -71,7 +82,9 @@ void Server::StartInternal() {
     background_thread_.Start();
 }
 
-void Server::StopInternal() {
+void
+Server::StopInternal()
+{
     if (http_sockfd_ != -1) {
         PCHECK(close(http_sockfd_) == 0) << "Failed to close HTTP server fd";
     }
@@ -82,11 +95,12 @@ void Server::StopInternal() {
     background_thread_.Join();
 }
 
-void Server::OnConnectionClose(server::ConnectionBase* connection) {
+void
+Server::OnConnectionClose(server::ConnectionBase* connection)
+{
     DCHECK(WithinMyEventLoopThread());
     int conn_type = (connection->type() & kConnectionTypeMask);
-    if (conn_type == kHttpConnectionTypeId
-          || conn_type == kGrpcConnectionTypeId) {
+    if (conn_type == kHttpConnectionTypeId || conn_type == kGrpcConnectionTypeId) {
         absl::MutexLock lk(&mu_);
         DCHECK(connections_.contains(connection->id()));
         connections_.erase(connection->id());
@@ -102,37 +116,46 @@ void Server::OnConnectionClose(server::ConnectionBase* connection) {
     }
 }
 
-void Server::SetupHttpServer() {
+void
+Server::SetupHttpServer()
+{
     // Listen on address:http_port for HTTP requests
     std::string address = absl::GetFlag(FLAGS_listen_addr);
     CHECK(!address.empty());
     CHECK_NE(http_port_, -1);
-    http_sockfd_ = utils::TcpSocketBindAndListen(
-        address, gsl::narrow_cast<uint16_t>(http_port_),
-        absl::GetFlag(FLAGS_socket_listen_backlog));
+    http_sockfd_ =
+        utils::TcpSocketBindAndListen(address,
+                                      gsl::narrow_cast<uint16_t>(http_port_),
+                                      absl::GetFlag(FLAGS_socket_listen_backlog));
     CHECK(http_sockfd_ != -1)
         << fmt::format("Failed to listen on {}:{}", address, http_port_);
     HLOG_F(INFO, "Listen on {}:{} for HTTP requests", address, http_port_);
-    ListenForNewConnections(
-        http_sockfd_, absl::bind_front(&Server::OnNewHttpConnection, this));
+    ListenForNewConnections(http_sockfd_,
+                            absl::bind_front(&Server::OnNewHttpConnection, this));
 }
 
-void Server::SetupGrpcServer() {
+void
+Server::SetupGrpcServer()
+{
     // Listen on address:grpc_port for gRPC requests
     std::string address = absl::GetFlag(FLAGS_listen_addr);
     CHECK(!address.empty());
     CHECK_NE(grpc_port_, -1);
-    grpc_sockfd_ = utils::TcpSocketBindAndListen(
-        address, gsl::narrow_cast<uint16_t>(grpc_port_),
-        absl::GetFlag(FLAGS_socket_listen_backlog));
+    grpc_sockfd_ =
+        utils::TcpSocketBindAndListen(address,
+                                      gsl::narrow_cast<uint16_t>(grpc_port_),
+                                      absl::GetFlag(FLAGS_socket_listen_backlog));
     CHECK(grpc_sockfd_ != -1)
         << fmt::format("Failed to listen on {}:{}", address, grpc_port_);
     HLOG_F(INFO, "Listen on {}:{} for gRPC requests", address, grpc_port_);
-    ListenForNewConnections(
-        grpc_sockfd_, absl::bind_front(&Server::OnNewGrpcConnection, this));
+    ListenForNewConnections(grpc_sockfd_,
+                            absl::bind_front(&Server::OnNewGrpcConnection, this));
 }
 
-void Server::OnNewHttpFuncCall(HttpConnection* connection, FuncCallContext* func_call_context) {
+void
+Server::OnNewHttpFuncCall(HttpConnection* connection,
+                          FuncCallContext* func_call_context)
+{
     auto func_entry = func_config_.find_by_func_name(func_call_context->func_name());
     if (func_entry == nullptr) {
         func_call_context->set_status(FuncCallContext::kNotFound);
@@ -140,18 +163,24 @@ void Server::OnNewHttpFuncCall(HttpConnection* connection, FuncCallContext* func
         return;
     }
     uint32_t call_id = next_call_id_.fetch_add(1, std::memory_order_relaxed);
-    FuncCall func_call = FuncCallHelper::New(gsl::narrow_cast<uint16_t>(func_entry->func_id),
-                                             /* client_id= */ 0, call_id);
+    FuncCall func_call =
+        FuncCallHelper::New(gsl::narrow_cast<uint16_t>(func_entry->func_id),
+                            /* client_id= */ 0,
+                            call_id);
     VLOG(1) << "OnNewHttpFuncCall: " << FuncCallHelper::DebugString(func_call);
     func_call_context->set_func_call(func_call);
     OnNewFuncCallCommon(connection->ref_self(), func_call_context);
 }
 
-void Server::OnNewGrpcFuncCall(GrpcConnection* connection, FuncCallContext* func_call_context) {
+void
+Server::OnNewGrpcFuncCall(GrpcConnection* connection,
+                          FuncCallContext* func_call_context)
+{
     auto func_entry = func_config_.find_by_func_name(func_call_context->func_name());
     std::string method_name(func_call_context->method_name());
-    if (func_entry == nullptr || !func_entry->is_grpc_service
-          || func_entry->grpc_method_ids.count(method_name) == 0) {
+    if (func_entry == nullptr || !func_entry->is_grpc_service ||
+        func_entry->grpc_method_ids.count(method_name) == 0)
+    {
         func_call_context->set_status(FuncCallContext::kNotFound);
         connection->OnFuncCallFinished(func_call_context);
         return;
@@ -160,30 +189,40 @@ void Server::OnNewGrpcFuncCall(GrpcConnection* connection, FuncCallContext* func
     FuncCall func_call = FuncCallHelper::NewWithMethod(
         gsl::narrow_cast<uint16_t>(func_entry->func_id),
         gsl::narrow_cast<uint16_t>(func_entry->grpc_method_ids.at(method_name)),
-        /* client_id= */ 0, call_id);
+        /* client_id= */ 0,
+        call_id);
     VLOG(1) << "OnNewGrpcFuncCall: " << FuncCallHelper::DebugString(func_call);
     func_call_context->set_func_call(func_call);
     OnNewFuncCallCommon(connection->ref_self(), func_call_context);
 }
 
-void Server::DiscardFuncCall(FuncCallContext* func_call_context) {
+void
+Server::DiscardFuncCall(FuncCallContext* func_call_context)
+{
     absl::MutexLock lk(&mu_);
     discarded_func_calls_.insert(func_call_context->func_call().full_call_id);
 }
 
-void Server::OnEngineNodeOnline(uint16_t node_id) {
+void
+Server::OnEngineNodeOnline(uint16_t node_id)
+{
     DCHECK(zk_session()->WithinMyEventLoopThread());
     HLOG_F(INFO, "Engine node {} is online", node_id);
     SomeIOWorker()->ScheduleFunction(
-        nullptr, absl::bind_front(&Server::TryDispatchingPendingFuncCalls, this));
+        nullptr,
+        absl::bind_front(&Server::TryDispatchingPendingFuncCalls, this));
 }
 
-void Server::OnEngineNodeOffline(uint16_t node_id) {
+void
+Server::OnEngineNodeOffline(uint16_t node_id)
+{
     DCHECK(zk_session()->WithinMyEventLoopThread());
     HLOG_F(INFO, "Engine node {} is offline", node_id);
 }
 
-void Server::TryDispatchingPendingFuncCalls() {
+void
+Server::TryDispatchingPendingFuncCalls()
+{
     mu_.Lock();
     while (!pending_func_calls_.empty()) {
         FuncCallState state = std::move(pending_func_calls_.front());
@@ -207,11 +246,14 @@ void Server::TryDispatchingPendingFuncCalls() {
         bool dispatched = false;
         if (node_picked) {
             if (async_call) {
-                dispatched = DispatchAsyncFuncCall(
-                    func_call, state.logspace, STRING_AS_SPAN(state.input), node_id);
+                dispatched = DispatchAsyncFuncCall(func_call,
+                                                   state.logspace,
+                                                   STRING_AS_SPAN(state.input),
+                                                   node_id);
             } else {
-                dispatched = DispatchFuncCall(
-                    std::move(parent_connection), state.context, node_id);
+                dispatched = DispatchFuncCall(std::move(parent_connection),
+                                              state.context,
+                                              node_id);
             }
         }
         mu_.Lock();
@@ -231,11 +273,15 @@ void Server::TryDispatchingPendingFuncCalls() {
     mu_.Unlock();
 }
 
-bool Server::SendMessageToEngine(uint16_t node_id, const GatewayMessage& message,
-                                 std::span<const char> payload) {
-    server::EgressHub* hub = CurrentIOWorkerChecked()->PickOrCreateConnection<server::EgressHub>(
-        kEngineEgressHubTypeId + node_id,
-        absl::bind_front(&Server::CreateEngineEgressHub, this, node_id));
+bool
+Server::SendMessageToEngine(uint16_t node_id,
+                            const GatewayMessage& message,
+                            std::span<const char> payload)
+{
+    server::EgressHub* hub =
+        CurrentIOWorkerChecked()->PickOrCreateConnection<server::EgressHub>(
+            kEngineEgressHubTypeId + node_id,
+            absl::bind_front(&Server::CreateEngineEgressHub, this, node_id));
     if (hub == nullptr) {
         return false;
     }
@@ -245,12 +291,15 @@ bool Server::SendMessageToEngine(uint16_t node_id, const GatewayMessage& message
     return true;
 }
 
-void Server::HandleFuncCallCompleteOrFailedMessage(uint16_t node_id,
-                                                   const GatewayMessage& message,
-                                                   std::span<const char> payload) {
-    DCHECK(GatewayMessageHelper::IsFuncCallComplete(message)
-             || GatewayMessageHelper::IsFuncCallFailed(message));
+void
+Server::HandleFuncCallCompleteOrFailedMessage(uint16_t node_id,
+                                              const GatewayMessage& message,
+                                              std::span<const char> payload)
+{
+    DCHECK(GatewayMessageHelper::IsFuncCallComplete(message) ||
+           GatewayMessageHelper::IsFuncCallFailed(message));
     FuncCall func_call = GatewayMessageHelper::GetFuncCall(message);
+    HVLOG(1) << "OnFuncCallCompleted " << FuncCallHelper::DebugString(func_call);
     node_manager_.FuncCallFinished(func_call, node_id);
     bool async_call = false;
     AsyncCallResult async_result;
@@ -289,8 +338,8 @@ void Server::HandleFuncCallCompleteOrFailedMessage(uint16_t node_id,
             uint16_t func_id = func_call.func_id;
             DCHECK(per_func_stats_.contains(func_id));
             PerFuncStat* per_func_stat = per_func_stats_[func_id].get();
-            per_func_stat->end2end_delay_stat.AddSample(gsl::narrow_cast<int32_t>(
-                current_timestamp - state.recv_timestamp));
+            per_func_stat->end2end_delay_stat.AddSample(
+                gsl::narrow_cast<int32_t>(current_timestamp - state.recv_timestamp));
         }
         running_func_calls_.erase(func_call.full_call_id);
     }
@@ -298,7 +347,8 @@ void Server::HandleFuncCallCompleteOrFailedMessage(uint16_t node_id,
         if (GatewayMessageHelper::IsFuncCallFailed(message)) {
             async_result.success = false;
             auto func_entry = func_config_.find_by_func_id(func_call.func_id);
-            HLOG_F(WARNING, "Async call of {} failed",
+            HLOG_F(WARNING,
+                   "Async call of {} failed",
                    DCHECK_NOTNULL(func_entry)->func_name);
         } else {
             async_result.success = true;
@@ -319,10 +369,14 @@ void Server::HandleFuncCallCompleteOrFailedMessage(uint16_t node_id,
     TryDispatchingPendingFuncCalls();
 }
 
-void Server::OnRecvEngineMessage(uint16_t node_id, const GatewayMessage& message,
-                                 std::span<const char> payload) {
-    if (GatewayMessageHelper::IsFuncCallComplete(message)
-            || GatewayMessageHelper::IsFuncCallFailed(message)) {
+void
+Server::OnRecvEngineMessage(uint16_t node_id,
+                            const GatewayMessage& message,
+                            std::span<const char> payload)
+{
+    if (GatewayMessageHelper::IsFuncCallComplete(message) ||
+        GatewayMessageHelper::IsFuncCallFailed(message))
+    {
         HandleFuncCallCompleteOrFailedMessage(node_id, message, payload);
     } else {
         HLOG(ERROR) << "Unknown engine message type";
@@ -333,14 +387,19 @@ Server::PerFuncStat::PerFuncStat(uint16_t func_id)
     : last_request_timestamp(-1),
       incoming_requests_stat(stat::Counter::StandardReportCallback(
           fmt::format("incoming_requests[{}]", func_id))),
-      request_interval_stat(stat::StatisticsCollector<int32_t>::StandardReportCallback(
-          fmt::format("request_interval[{}]", func_id))),
+      request_interval_stat(
+          stat::StatisticsCollector<int32_t>::StandardReportCallback(
+              fmt::format("request_interval[{}]", func_id))),
       end2end_delay_stat(stat::StatisticsCollector<int32_t>::StandardReportCallback(
-          fmt::format("end2end_delay[{}]", func_id))) {}
+          fmt::format("end2end_delay[{}]", func_id)))
+{}
 
-void Server::TickNewFuncCall(uint16_t func_id, int64_t current_timestamp) {
+void
+Server::TickNewFuncCall(uint16_t func_id, int64_t current_timestamp)
+{
     if (!per_func_stats_.contains(func_id)) {
-        per_func_stats_[func_id] = std::unique_ptr<PerFuncStat>(new PerFuncStat(func_id));
+        per_func_stats_[func_id] =
+            std::unique_ptr<PerFuncStat>(new PerFuncStat(func_id));
     }
     PerFuncStat* per_func_stat = per_func_stats_[func_id].get();
     per_func_stat->incoming_requests_stat.Tick();
@@ -354,18 +413,21 @@ void Server::TickNewFuncCall(uint16_t func_id, int64_t current_timestamp) {
     per_func_stat->last_request_timestamp = current_timestamp;
 }
 
-void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_connection,
-                                 FuncCallContext* func_call_context) {
+void
+Server::OnNewFuncCallCommon(
+    std::shared_ptr<server::ConnectionBase> parent_connection,
+    FuncCallContext* func_call_context)
+{
     FuncCall func_call = func_call_context->func_call();
     FuncCallState state = {
         .func_call = func_call,
         .logspace = func_call_context->logspace(),
-        .connection_id = func_call_context->is_async() ? -1 : parent_connection->id(),
+        .connection_id =
+            func_call_context->is_async() ? -1 : parent_connection->id(),
         .context = func_call_context->is_async() ? nullptr : func_call_context,
         .recv_timestamp = GetMonotonicMicroTimestamp(),
         .dispatch_timestamp = 0,
-        .input = std::string()
-    };
+        .input = std::string()};
     uint16_t node_id;
     bool node_picked = node_manager_.PickNodeForNewFuncCall(func_call, &node_id);
     {
@@ -377,7 +439,8 @@ void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_
         }
         if (last_request_timestamp_ != -1) {
             requests_instant_rps_stat_.AddSample(
-                1e6f / gsl::narrow_cast<float>(current_timestamp - last_request_timestamp_));
+                1e6f / gsl::narrow_cast<float>(current_timestamp -
+                                               last_request_timestamp_));
             request_interval_stat_.AddSample(gsl::narrow_cast<int32_t>(
                 current_timestamp - last_request_timestamp_));
         }
@@ -396,8 +459,11 @@ void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_
     if (func_call_context->is_async()) {
         if (!node_picked) {
             func_call_context->set_status(FuncCallContext::kSuccess);
-        } else if (DispatchAsyncFuncCall(func_call, func_call_context->logspace(),
-                                         func_call_context->input(), node_id)) {
+        } else if (DispatchAsyncFuncCall(func_call,
+                                         func_call_context->logspace(),
+                                         func_call_context->input(),
+                                         node_id))
+        {
             dispatched = true;
             func_call_context->set_status(FuncCallContext::kSuccess);
         } else {
@@ -405,8 +471,14 @@ void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_
         }
         FinishFuncCall(std::move(parent_connection), func_call_context);
     } else if (node_picked && DispatchFuncCall(std::move(parent_connection),
-                                               func_call_context, node_id)) {
+                                               func_call_context,
+                                               node_id))
+    {
         dispatched = true;
+        uint32_t call_id = func_call.call_id;
+        HVLOG(1) << fmt::format("dispatch sync call_id {} to engine {}",
+                                call_id,
+                                node_id);
     }
     if (dispatched) {
         DCHECK(node_picked);
@@ -418,13 +490,19 @@ void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_
     }
 }
 
-bool Server::DispatchFuncCall(std::shared_ptr<server::ConnectionBase> parent_connection,
-                              FuncCallContext* func_call_context, uint16_t node_id) {
+bool
+Server::DispatchFuncCall(std::shared_ptr<server::ConnectionBase> parent_connection,
+                         FuncCallContext* func_call_context,
+                         uint16_t node_id)
+{
     FuncCall func_call = func_call_context->func_call();
-    GatewayMessage dispatch_message = GatewayMessageHelper::NewDispatchFuncCall(
-        func_call, func_call_context->logspace());
-    dispatch_message.payload_size = gsl::narrow_cast<uint32_t>(func_call_context->input().size());
-    bool success = SendMessageToEngine(node_id, dispatch_message, func_call_context->input());
+    GatewayMessage dispatch_message =
+        GatewayMessageHelper::NewDispatchFuncCall(func_call,
+                                                  func_call_context->logspace());
+    dispatch_message.payload_size =
+        gsl::narrow_cast<uint32_t>(func_call_context->input().size());
+    bool success =
+        SendMessageToEngine(node_id, dispatch_message, func_call_context->input());
     if (!success) {
         node_manager_.FuncCallFinished(func_call, node_id);
         func_call_context->set_status(FuncCallContext::kNotFound);
@@ -433,10 +511,14 @@ bool Server::DispatchFuncCall(std::shared_ptr<server::ConnectionBase> parent_con
     return success;
 }
 
-bool Server::DispatchAsyncFuncCall(const FuncCall& func_call, uint32_t logspace,
-                                   std::span<const char> input, uint16_t node_id) {
-    GatewayMessage dispatch_message = GatewayMessageHelper::NewDispatchFuncCall(
-        func_call, logspace);
+bool
+Server::DispatchAsyncFuncCall(const FuncCall& func_call,
+                              uint32_t logspace,
+                              std::span<const char> input,
+                              uint16_t node_id)
+{
+    GatewayMessage dispatch_message =
+        GatewayMessageHelper::NewDispatchFuncCall(func_call, logspace);
     dispatch_message.payload_size = gsl::narrow_cast<uint32_t>(input.size());
     bool success = SendMessageToEngine(node_id, dispatch_message, input);
     if (!success) {
@@ -445,21 +527,31 @@ bool Server::DispatchAsyncFuncCall(const FuncCall& func_call, uint32_t logspace,
     return success;
 }
 
-void Server::FinishFuncCall(std::shared_ptr<server::ConnectionBase> parent_connection,
-                            FuncCallContext* func_call_context) {
+void
+Server::FinishFuncCall(std::shared_ptr<server::ConnectionBase> parent_connection,
+                       FuncCallContext* func_call_context)
+{
     switch (parent_connection->type() & kConnectionTypeMask) {
     case kHttpConnectionTypeId:
-        parent_connection->as_ptr<HttpConnection>()->OnFuncCallFinished(func_call_context);
+        HVLOG(1) << fmt::format(
+            "Finish http FuncCall: {} status {}",
+            FuncCallHelper::DebugString(func_call_context->func_call()),
+            static_cast<int>(func_call_context->status()));
+        parent_connection->as_ptr<HttpConnection>()->OnFuncCallFinished(
+            func_call_context);
         break;
     case kGrpcConnectionTypeId:
-        parent_connection->as_ptr<GrpcConnection>()->OnFuncCallFinished(func_call_context);
+        parent_connection->as_ptr<GrpcConnection>()->OnFuncCallFinished(
+            func_call_context);
         break;
     default:
         UNREACHABLE();
     }
 }
 
-std::string Server::EncodeAsyncCallResult(const Server::AsyncCallResult& result) {
+std::string
+Server::EncodeAsyncCallResult(const Server::AsyncCallResult& result)
+{
     nlohmann::json data;
     data["success"] = result.success;
     data["funcId"] = result.func_id;
@@ -473,7 +565,9 @@ std::string Server::EncodeAsyncCallResult(const Server::AsyncCallResult& result)
     return std::string(data.dump());
 }
 
-void Server::BackgroundThreadMain() {
+void
+Server::BackgroundThreadMain()
+{
     std::optional<int> fd;
     auto close_file = gsl::finally([&fd] {
         if (fd.has_value()) {
@@ -503,8 +597,11 @@ void Server::BackgroundThreadMain() {
     HLOG(INFO) << "Background thread stopped";
 }
 
-void Server::OnRemoteMessageConn(const protocol::HandshakeMessage& handshake, int sockfd) {
-    protocol::ConnType conn_type = static_cast<protocol::ConnType>(handshake.conn_type);
+void
+Server::OnRemoteMessageConn(const protocol::HandshakeMessage& handshake, int sockfd)
+{
+    protocol::ConnType conn_type =
+        static_cast<protocol::ConnType>(handshake.conn_type);
     if (conn_type != protocol::ConnType::ENGINE_TO_GATEWAY) {
         HLOG(ERROR) << "Invalid connection type: " << handshake.conn_type;
         close(sockfd);
@@ -512,24 +609,30 @@ void Server::OnRemoteMessageConn(const protocol::HandshakeMessage& handshake, in
     }
 
     uint16_t node_id = handshake.src_node_id;
-    auto connection = std::make_unique<server::IngressConnection>(
-        kEngineIngressTypeId + node_id, sockfd, sizeof(GatewayMessage));
+    auto connection =
+        std::make_unique<server::IngressConnection>(kEngineIngressTypeId + node_id,
+                                                    sockfd,
+                                                    sizeof(GatewayMessage));
     connection->SetMessageFullSizeCallback(
         &server::IngressConnection::GatewayMessageFullSizeCallback);
     connection->SetNewMessageCallback(
         server::IngressConnection::BuildNewGatewayMessageCallback(
             absl::bind_front(&Server::OnRecvEngineMessage, this, node_id)));
 
-    RegisterConnection(PickIOWorkerForConnType(connection->type()), connection.get());
+    RegisterConnection(PickIOWorkerForConnType(connection->type()),
+                       connection.get());
     DCHECK_GE(connection->id(), 0);
     DCHECK(!engine_ingress_conns_.contains(connection->id()));
     engine_ingress_conns_[connection->id()] = std::move(connection);
 }
 
-void Server::OnNewHttpConnection(int sockfd) {
+void
+Server::OnNewHttpConnection(int sockfd)
+{
     std::shared_ptr<server::ConnectionBase> connection(
         new HttpConnection(this, next_http_connection_id_++, sockfd));
-    RegisterConnection(PickIOWorkerForConnType(connection->type()), connection.get());
+    RegisterConnection(PickIOWorkerForConnType(connection->type()),
+                       connection.get());
     DCHECK_GE(connection->id(), 0);
     {
         absl::MutexLock lk(&mu_);
@@ -538,10 +641,13 @@ void Server::OnNewHttpConnection(int sockfd) {
     }
 }
 
-void Server::OnNewGrpcConnection(int sockfd) {
+void
+Server::OnNewGrpcConnection(int sockfd)
+{
     std::shared_ptr<server::ConnectionBase> connection(
         new GrpcConnection(this, next_grpc_connection_id_++, sockfd));
-    RegisterConnection(PickIOWorkerForConnType(connection->type()), connection.get());
+    RegisterConnection(PickIOWorkerForConnType(connection->type()),
+                       connection.get());
     DCHECK_GE(connection->id(), 0);
     {
         absl::MutexLock lk(&mu_);
@@ -550,18 +656,23 @@ void Server::OnNewGrpcConnection(int sockfd) {
     }
 }
 
-server::EgressHub* Server::CreateEngineEgressHub(uint16_t node_id, 
-                                                 server::IOWorker* io_worker) {
+server::EgressHub*
+Server::CreateEngineEgressHub(uint16_t node_id, server::IOWorker* io_worker)
+{
     struct sockaddr_in addr;
-    if (!node_watcher()->GetNodeAddr(server::NodeWatcher::kEngineNode, node_id, &addr)) {
+    if (!node_watcher()->GetNodeAddr(server::NodeWatcher::kEngineNode,
+                                     node_id,
+                                     &addr))
+    {
         return nullptr;
     }
     auto egress_hub = std::make_unique<server::EgressHub>(
         kEngineEgressHubTypeId + node_id,
-        &addr, absl::GetFlag(FLAGS_message_conn_per_worker));
-    egress_hub->SetHandshakeMessageCallback([] (std::string* handshake) {
-        *handshake = protocol::EncodeHandshakeMessage(
-            protocol::ConnType::GATEWAY_TO_ENGINE);
+        &addr,
+        absl::GetFlag(FLAGS_message_conn_per_worker));
+    egress_hub->SetHandshakeMessageCallback([](std::string* handshake) {
+        *handshake =
+            protocol::EncodeHandshakeMessage(protocol::ConnType::GATEWAY_TO_ENGINE);
     });
     RegisterConnection(io_worker, egress_hub.get());
     DCHECK_GE(egress_hub->id(), 0);
@@ -574,5 +685,4 @@ server::EgressHub* Server::CreateEngineEgressHub(uint16_t node_id,
     return hub;
 }
 
-}  // namespace gateway
-}  // namespace faas
+}} // namespace faas::gateway

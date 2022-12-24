@@ -55,6 +55,7 @@ bool FuncProcess::Start(uv_loop_t *uv_loop, utils::BufferPool *read_buffer_pool)
         subprocess_.SetStandardFile(
             uv::Subprocess::kStderr,
             fs_utils::JoinPath(launcher_->fprocess_output_dir(), fname_prefix + ".stderr"));
+        
     }
     if (!launcher_->fprocess_working_dir().empty()) {
         subprocess_.SetWorkingDir(launcher_->fprocess_working_dir());

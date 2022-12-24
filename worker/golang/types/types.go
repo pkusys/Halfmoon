@@ -11,6 +11,13 @@ type LogEntry struct {
 	AuxData []byte
 }
 
+type CCLogEntry struct {
+	// BatchId uint64
+	SeqNum  uint64
+	Data    []byte
+	AuxData []byte
+}
+
 type Environment interface {
 	InvokeFunc(ctx context.Context, funcName string, input []byte) ( /* output */ []byte, error)
 	InvokeFuncAsync(ctx context.Context, funcName string, input []byte) error
@@ -32,6 +39,14 @@ type Environment interface {
 	SharedLogCheckTail(ctx context.Context, tag uint64) (*LogEntry, error)
 	// Set auxiliary data for log entry of given `seqNum`
 	SharedLogSetAuxData(ctx context.Context, seqNum uint64, auxData []byte) error
+	// Concurrency control
+	// common
+	SLogCCReadPrev(ctx context.Context, tag uint64, seqNum uint64) (*CCLogEntry, error)
+	SLogCCSetAuxData(ctx context.Context, tag uint64, seqNum uint64, auxData []byte) error
+	// occ
+	SLogCCTxnStart(ctx context.Context) ( /* txn_id,seqnum */ uint64, uint64, error)
+	SLogCCTxnCommit(ctx context.Context, txnId uint64, seqNum uint64, data []byte) ( /* seqnum */ uint64, error)
+	// lock here
 }
 
 type FuncHandler interface {

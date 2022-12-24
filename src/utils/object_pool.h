@@ -15,24 +15,30 @@ __BEGIN_THIRD_PARTY_HEADERS
 __END_THIRD_PARTY_HEADERS
 #endif
 
-namespace faas {
-namespace utils {
+namespace faas { namespace utils {
 
-template<class T>
-T* DefaultObjectConstructor() {
+using Arena = google::protobuf::Arena;
+
+template <class T>
+T*
+DefaultObjectConstructor()
+{
     return new T();
 }
 
 // SimpleObjectPool is NOT thread-safe
-template<class T>
+template <class T>
 class SimpleObjectPool {
 public:
-    explicit SimpleObjectPool(std::function<T*()> object_constructor = DefaultObjectConstructor<T>)
-        : object_constructor_(object_constructor) {}
+    explicit SimpleObjectPool(
+        std::function<T*()> object_constructor = DefaultObjectConstructor<T>)
+        : object_constructor_(object_constructor)
+    {}
 
     ~SimpleObjectPool() {}
 
-    T* Get() {
+    T* Get()
+    {
         if (free_objs_.empty()) {
             T* new_obj = object_constructor_();
             free_objs_.push_back(new_obj);
@@ -44,9 +50,7 @@ public:
         return obj;
     }
 
-    void Return(T* obj) {
-        free_objs_.push_back(obj);
-    }
+    void Return(T* obj) { free_objs_.push_back(obj); }
 
 private:
     std::function<T*()> object_constructor_;
@@ -63,24 +67,23 @@ private:
 
 #ifdef __FAAS_SRC
 
-template<class T>
+template <class T>
 class ProtobufMessagePool {
 public:
     ProtobufMessagePool() {}
     ~ProtobufMessagePool() {}
 
-    T* Get() {
+    T* Get()
+    {
         if (free_objs_.empty()) {
             free_objs_.push_back(google::protobuf::Arena::CreateMessage<T>(&arena_));
         }
         T* obj = free_objs_.back();
         free_objs_.pop_back();
-        return obj; 
+        return obj;
     }
 
-    void Return(T* obj) {
-        free_objs_.push_back(obj);
-    }
+    void Return(T* obj) { free_objs_.push_back(obj); }
 
 private:
     google::protobuf::Arena arena_;
@@ -89,15 +92,46 @@ private:
     DISALLOW_COPY_AND_ASSIGN(ProtobufMessagePool);
 };
 
-template<class T>
+template <class T>
+class ProtobufMessagePoolWithArena {
+public:
+    ProtobufMessagePoolWithArena() {}
+
+    void SetArena(Arena* arena) { arena_ = arena; }
+
+    ~ProtobufMessagePoolWithArena() {}
+
+    T* Get()
+    {
+        if (free_objs_.empty()) {
+            free_objs_.push_back(Arena::CreateMessage<T>(arena_));
+        }
+        T* obj = free_objs_.back();
+        free_objs_.pop_back();
+        return obj;
+    }
+
+    void Return(T* obj) { free_objs_.push_back(obj); }
+
+private:
+    Arena* arena_;
+    absl::InlinedVector<T*, 16> free_objs_;
+
+    DISALLOW_COPY_AND_ASSIGN(ProtobufMessagePoolWithArena);
+};
+
+template <class T>
 class ThreadSafeObjectPool {
 public:
-    explicit ThreadSafeObjectPool(std::function<T*()> object_constructor = DefaultObjectConstructor<T>)
-        : object_constructor_(object_constructor) {}
+    explicit ThreadSafeObjectPool(
+        std::function<T*()> object_constructor = DefaultObjectConstructor<T>)
+        : object_constructor_(object_constructor)
+    {}
 
     ~ThreadSafeObjectPool() {}
 
-    T* Get() {
+    T* Get()
+    {
         absl::MutexLock lk(&mu_);
         if (free_objs_.empty()) {
             T* new_obj = object_constructor_();
@@ -110,7 +144,8 @@ public:
         return obj;
     }
 
-    void Return(T* obj) {
+    void Return(T* obj)
+    {
         absl::MutexLock lk(&mu_);
         free_objs_.push_back(obj);
     }
@@ -125,7 +160,6 @@ private:
     DISALLOW_COPY_AND_ASSIGN(ThreadSafeObjectPool);
 };
 
-#endif  // __FAAS_SRC
+#endif // __FAAS_SRC
 
-}  // namespace utils
-}  // namespace faas
+}} // namespace faas::utils

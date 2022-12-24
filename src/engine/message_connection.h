@@ -7,12 +7,11 @@
 #include "utils/object_pool.h"
 #include "server/io_worker.h"
 
-namespace faas {
-namespace engine {
+namespace faas { namespace engine {
 
 class Engine;
 
-class MessageConnection final : public server::ConnectionBase {
+class MessageConnection final: public server::ConnectionBase {
 public:
     static constexpr size_t kBufSize = __FAAS_MESSAGE_SIZE * 4;
 
@@ -30,12 +29,13 @@ public:
 
     // Must be thread-safe
     void WriteMessage(const protocol::Message& message);
+    server::IOWorker* io_worker_;
+
 
 private:
     enum State { kCreated, kHandshake, kRunning, kClosing, kClosed };
 
     Engine* engine_;
-    server::IOWorker* io_worker_;
     State state_;
     uint16_t func_id_;
     uint16_t client_id_;
@@ -53,8 +53,8 @@ private:
     utils::AppendableBuffer write_message_buffer_;
 
     absl::Mutex write_message_mu_;
-    absl::InlinedVector<protocol::Message, 16>
-        pending_messages_ ABSL_GUARDED_BY(write_message_mu_);
+    absl::InlinedVector<protocol::Message, 16> pending_messages_
+        ABSL_GUARDED_BY(write_message_mu_);
 
     void RecvHandshakeMessage();
     void SendPendingMessages();
@@ -67,5 +67,4 @@ private:
     DISALLOW_COPY_AND_ASSIGN(MessageConnection);
 };
 
-}  // namespace engine
-}  // namespace faas
+}} // namespace faas::engine
