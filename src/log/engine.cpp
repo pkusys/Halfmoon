@@ -1,5 +1,6 @@
 #include "log/engine.h"
 
+#include "absl/synchronization/mutex.h"
 #include "base/logging.h"
 #include "base/std_span.h"
 #include "common/protocol.h"
@@ -28,6 +29,31 @@ using protocol::SharedLogMessage;
 using protocol::SharedLogMessageHelper;
 using protocol::SharedLogOpType;
 using protocol::SharedLogResultType;
+
+TxnEngine::TxnEngine(const View* view, uint16_t engine_id, uint16_t sequencer_id)
+    : engine_id_(engine_id),
+      next_localid_(bits::JoinTwo32(engine_id, 0))
+{
+    const View::NodeIdVec& engine_node_ids = view->GetEngineNodes();
+    size_t idx = static_cast<size_t>(absl::c_find(engine_node_ids, engine_id) -
+                                     engine_node_ids.begin());
+    DCHECK_LT(idx, engine_node_ids.size());
+    engine_idx_ = idx;
+    const View::Engine* engine_node = view->GetEngineNode(engine_id);
+    replica_count_ = engine_node->GetStorageNodes().size();
+    logspace_id_ = bits::JoinTwo16(view->id(), sequencer_id);
+}
+
+TxnProgress*
+TxnEngine::RegisterTxnStart(LocalOp* op)
+{
+    absl::MutexLock lk(&start_mu_);
+    uint64_t localid = next_localid_++;
+    auto txn_progress = txn_progress_pool_.Get();
+    pending_txn_starts_[localid] = op;
+    running_txns_[localid] = txn_progress;
+    return txn_progress;
+}
 
 Engine::Engine(engine::Engine* engine)
     : EngineBase(engine),
@@ -219,30 +245,54 @@ BuildLocalCCReadOkResponse(uint64_t seqnum, std::span<const char> log_data)
         }                                                                          \
     } while (0)
 
+// void
+// Engine::HandleLocalCCTxnStart(LocalOp* op)
+// {
+//     DCHECK(op->type == SharedLogOpType::CC_TXN_START);
+//     const View* view = nullptr;
+//     {
+//         absl::ReaderMutexLock view_lk(&view_mu_);
+//         if (!current_view_active_) {
+//             HLOG(WARNING) << "Current view not active";
+//             FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
+//             return;
+//         }
+//         view = current_view_;
+//         op->logspace_id = view->LogSpaceIdentifier(op->user_logspace);
+//         auto producer_ptr =
+//         producer_collection_.GetLogSpaceChecked(op->logspace_id);
+//         {
+//             // TODO: separate this from log producer
+//             auto locked_producer = producer_ptr.Lock();
+//             locked_producer->RegisterTxnStart(op, &op->txn_localid);
+//         }
+//     }
+//     // HVLOG_F(1, "Handle local txn start: txn_id={:#x}", op->txn_localid);
+//     SharedLogMessage message =
+//         SharedLogMessageHelper::NewCCTxnStartMessage(op->txn_localid);
+//     message.logspace_id = op->logspace_id;
+//     message.user_logspace = op->user_logspace;
+//     uint16_t sequencer_id = bits::LowHalf32(op->logspace_id);
+//     bool success = SendSequencerMessage(sequencer_id, &message);
+//     if (!success) {
+//         HLOG(WARNING) << "Failed to send txn start message";
+//         FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
+//     }
+// }
+
 void
 Engine::HandleLocalCCTxnStart(LocalOp* op)
 {
     DCHECK(op->type == SharedLogOpType::CC_TXN_START);
-    const View* view = nullptr;
-    {
-        absl::ReaderMutexLock view_lk(&view_mu_);
-        if (!current_view_active_) {
-            HLOG(WARNING) << "Current view not active";
-            FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-            return;
-        }
-        view = current_view_;
-        op->logspace_id = view->LogSpaceIdentifier(op->user_logspace);
-        auto producer_ptr = producer_collection_.GetLogSpaceChecked(op->logspace_id);
-        {
-            // TODO: separate this from log producer
-            auto locked_producer = producer_ptr.Lock();
-            locked_producer->RegisterTxnStart(op, &op->txn_localid);
-        }
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
+        return;
     }
     // HVLOG_F(1, "Handle local txn start: txn_id={:#x}", op->txn_localid);
-    SharedLogMessage message =
-        SharedLogMessageHelper::NewCCTxnStartMessage(op->txn_localid);
+    txn_engine_->RegisterTxnStart(op);
+    
+    SharedLogMessage message = SharedLogMessageHelper::NewCCTxnStartMessage(localid);
     message.logspace_id = op->logspace_id;
     message.user_logspace = op->user_logspace;
     uint16_t sequencer_id = bits::LowHalf32(op->logspace_id);
@@ -288,7 +338,7 @@ Engine::HandleLocalCCTxnCommit(LocalOp* op)
     auto message = SharedLogMessageHelper::NewEmptySharedLogMessage();
     log_utils::FillReplicateMsgWithOp(message, op);
     ReplicateCCLogEntry(view, message, op->data.to_span());
-    op->message.reset(message);
+    // op->message.reset(message);
 }
 
 void
@@ -930,24 +980,24 @@ Engine::OnCCOpReplicated(const protocol::SharedLogMessage& message,
     HVLOG(1) << fmt::format("txn localid {:#x} op {:#x} replicated",
                             op->txn_localid,
                             static_cast<uint16_t>(op->type));
-    auto msg = op->message.get();
-    log_utils::ReorderMsgFromReplicateMsg(msg, op);
+    // auto msg = op->message.get();
+    // log_utils::ReorderMsgFromReplicateMsg(msg, op);
 
-    uint16_t sequencer_id = bits::LowHalf32(message.logspace_id);
-    bool success =
-        SendSequencerMessage(sequencer_id,
-                             msg,
-                             op->data.to_span().subspan(0, msg->payload_size));
-    if (!success) {
-        HLOG_F(ERROR,
-               "Failed to send reorder message to sequencer {}",
-               sequencer_id);
-        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-        return;
-    }
-    // CCLogEntry cc_entry;
-    // log_utils::FillCCLogEntryWithOp(&cc_entry, op);
-    // CCLogCachePut(&cc_entry);
+    // uint16_t sequencer_id = bits::LowHalf32(message.logspace_id);
+    // bool success =
+    //     SendSequencerMessage(sequencer_id,
+    //                          msg,
+    //                          op->data.to_span().subspan(0, msg->payload_size));
+    // if (!success) {
+    //     HLOG_F(ERROR,
+    //            "Failed to send reorder message to sequencer {}",
+    //            sequencer_id);
+    //     FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
+    //     return;
+    // }
+    // // CCLogEntry cc_entry;
+    // // log_utils::FillCCLogEntryWithOp(&cc_entry, op);
+    // // CCLogCachePut(&cc_entry);
 }
 
 void

@@ -249,6 +249,7 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
         break;
     case SharedLogOpType::CC_TXN_START:
         // op->txn_id = bits::JoinTwo32(my_node_id(), bits::LowHalf64(op->id));
+        op->data.AppendData(MessageHelper::GetInlineData(message));
         break;
     // case SharedLogOpType::CC_TXN_COMMIT:
     //     // op->txn_id = bits::JoinTwo32(my_node_id(), message.txn_id_lowhalf);
@@ -381,7 +382,7 @@ EngineBase::FinishLocalOpWithResponse(LocalOp* op,
     if (!engine_->SendFuncWorkerMessage(op->client_id, response)) {
         HLOG(FATAL) << "Failed to send response to client";
     }
-    op->message.reset();
+    // op->message.reset();
     log_op_pool_.Return(op);
 }
 

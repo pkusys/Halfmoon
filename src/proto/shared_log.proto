@@ -123,6 +123,14 @@ message IndexDataProto {
     repeated uint64 user_tags      = 6;
 }
 
+message TxnIndexProto {
+    uint32 engine_id = 1;
+    // low half, omit high half logspace_id
+    uint32 start_seqnum = 2;
+    uint32 end_of_batch = 3;
+    repeated uint32 write_set_splits = 4;
+    repeated uint64 write_tags       = 5;
+}
 
 // struct TxnCommonHeader {
 //     uint16_t record_type;

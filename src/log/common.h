@@ -36,7 +36,7 @@ struct SharedLogRequest {
     }
 };
 
-using UserTagVec = absl::InlinedVector<uint64_t, 4>;
+using UserTagVec = absl::InlinedVector<uint64_t, 8>;
 
 struct LogMetaData {
     uint32_t user_logspace;

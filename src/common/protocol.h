@@ -119,7 +119,7 @@ enum class SharedLogOpType : uint16_t {
     REORDER = 0x16,         // Engine to Sequencer
     CC_GLOBAL_BATCH = 0x17, // Sequencer to Engine
     // REPLICATE_CC = 0x17,    // Engine to Storage
-    RESPONSE = 0x20
+    RESPONSE = 0x20,
 };
 
 enum class SharedLogResultType : uint16_t {
@@ -143,6 +143,12 @@ enum class SharedLogResultType : uint16_t {
     // LOCK_OK     = 0x42, // Lock ok
     // LOCK_FAILED = 0x43,
 };
+
+struct TxnStartHeader {
+    uint16_t read_set_size;
+    uint16_t write_set_size;
+};
+static_assert(sizeof(TxnStartHeader) == 4, "Unexpected Message size");
 
 // worker->engine: txn_id_lowhalf (high half engine_id, to be set by engine)
 // worker->engine: log_seqnum(high half log space id)
@@ -206,15 +212,19 @@ struct Message {
         };
     } __attribute__((packed));
 
-    // union {
-    //     struct {
-    //         uint16_t log_num_tags;      // [36:38]
-    //         uint16_t log_aux_data_size; // [38:40]
-    //     } __attribute__((packed));
-    //     uint32_t batch_subidx; // [36:40] Used in READ,
-    // };
-    uint16_t log_num_tags;      // [36:38]
-    uint16_t log_aux_data_size; // [38:40]
+    union {
+        struct {
+            uint16_t log_num_tags;      // [36:38]
+            uint16_t log_aux_data_size; // [38:40]
+        } __attribute__((packed));
+        struct {
+            uint16_t read_set_size;  // [36:38]
+            uint16_t write_set_size; // [38:40]
+        } __attribute__((packed));
+    };
+
+    // uint16_t log_num_tags;      // [36:38]
+    // uint16_t log_aux_data_size; // [38:40]
 
     uint64_t log_tag;         // [40:48]
     uint64_t log_client_data; // [48:56] will be preserved for response to clients
@@ -319,24 +329,25 @@ struct SharedLogMessage {
         struct {
             uint16_t num_tags;      // [24:26]
             uint16_t aux_data_size; // [26:28]
-
-            uint32_t _5_padding_5_;
+            // uint32_t _5_padding_5_;
+            uint16_t read_set_size;  // [28:30]
+            uint16_t write_set_size; // [30:32]
         } __attribute__((packed));
     };
 
     uint64_t user_metalog_progress; // [32:40]
 
     union {
-        uint64_t localid; // [40:48]
-        uint64_t txn_id;
+        uint64_t localid;      // [40:48]
+        uint64_t txn_id;       // [40:48] deprecated
         uint64_t query_seqnum; // [40:48]
         uint64_t trim_seqnum;  // [40:48]
     };
 
     union {
-        // uint64_t txn_id;
-        uint64_t txn_localid; // [48:56]
-        uint64_t client_data; // [48:56]
+        uint64_t txn_localid;  // [48:56] deprecated
+        uint64_t client_data;  // [48:56]
+        uint64_t runtime_cost; // [48:56] us, in txn_start
     };
 
     uint64_t prev_found_seqnum; // [56:64]
@@ -708,11 +719,12 @@ public:
         return message;
     }
 
-    static SharedLogMessage NewCCTxnStartMessage(uint64_t txn_id)
+    static SharedLogMessage NewCCTxnStartMessage(uint64_t localid)
     {
         NEW_EMPTY_SHAREDLOG_MESSAGE(message);
         message.op_type = static_cast<uint16_t>(SharedLogOpType::CC_TXN_START);
-        message.txn_id = txn_id;
+        message.localid = localid;
+        // message.txn_id = txn_id;
         return message;
     }
 

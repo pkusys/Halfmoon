@@ -1,5 +1,9 @@
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/synchronization/mutex.h"
 #include "log/common.h"
 #include "log/engine_base.h"
 #include "log/log_space.h"
@@ -8,6 +12,11 @@
 #include "log/utils.h"
 #include "proto/shared_log.pb.h"
 #include "utils/bits.h"
+#include "utils/object_pool.h"
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <utility>
 
 namespace faas {
 
@@ -17,6 +26,70 @@ class Engine;
 }
 
 namespace log {
+
+// class Engine;
+
+struct TxnProgress {
+    // uint64_t seqnum;
+    LocalOp* pending_commit;
+    std::atomic<size_t> remaining_ops;
+    absl::flat_hash_map<uint64_t, /* expected_replicas */ std::atomic<uint16_t>>
+        pending_writes;
+    UserTagVec read_set;
+
+    void init(UserTagVec& read_set,
+              UserTagVec& write_set,
+              uint16_t expected_replicas)
+    {
+        pending_commit = nullptr;
+        remaining_ops = write_set.size();
+        pending_writes.clear();
+        for (uint64_t tag: write_set) {
+            pending_writes[tag] = expected_replicas;
+        }
+        this->read_set = std::move(read_set);
+    }
+};
+
+class TxnEngine {
+public:
+    explicit TxnEngine(const View* view, uint16_t engine_id, uint16_t sequencer_id);
+    ~TxnEngine();
+
+    uint16_t engine_id_;
+    size_t engine_idx_;
+    size_t replica_count_;
+    uint32_t logspace_id_;
+
+    absl::Mutex start_mu_;
+    uint64_t next_localid_;
+    utils::SimpleObjectPool<TxnProgress> txn_progress_pool_;
+    absl::flat_hash_map</* localid */ uint64_t,
+                        /* caller_data */ LocalOp*>
+        pending_txn_starts_ ABSL_GUARDED_BY(start_mu_);
+    absl::flat_hash_map</* localid */ uint64_t,
+                        /* caller_data */ TxnProgress*>
+        running_txns_ ABSL_GUARDED_BY(start_mu_);
+
+    TxnProgress* RegisterTxnStart(LocalOp* op);
+
+    absl::Mutex index_mu_;
+    absl::flat_hash_map</* seqnum */ uint32_t, uint16_t> engine_ids_;
+    absl::flat_hash_map</* tag */ uint64_t, std::vector<uint32_t>> seqnums_by_tag_;
+    // The following fields are for index compaction
+    // 1. active_seqnums are snapshots obtained at txn_start
+    // when a txn commits, it releases its snapshot, by which we assume that
+    // all aux data has been set and we can safely reconstruct view from the snapshot
+    // 2. upon committing, we trim indices for all tags in read set
+    std::set</* seqnum */ uint32_t> active_seqnums_;
+    uint32_t kMaxIndexSeqnumOverhead;
+
+    uint32_t applied_seqnum_position_;
+    uint32_t buffered_seqnum_position_;
+    utils::ProtobufMessagePool<TxnIndexProto> index_pool_;
+    // apply when buffered position == indexproto.end_of_batch
+    std::map</* start_seqnum */ uint32_t, TxnIndexProto*> pending_indices_;
+};
 
 class Engine final: public EngineBase {
 public:
@@ -29,8 +102,8 @@ public:
         const LogProducer::TxnStartResultVec& txn_start_results);
     void ProcessTxnCommitResult(
         const LogProducer::TxnCommitBatchResult& txn_commit_results);
-    
-    // std::atomic<uint64_t> finished_snapshot_;
+
+    std::unique_ptr<TxnEngine> txn_engine_;
 
 private:
     std::string log_header_;
@@ -67,9 +140,9 @@ private:
                             std::span<const char> payload) override;
     void OnRecvResponse(const protocol::SharedLogMessage& message,
                         std::span<const char> payload) override;
+
     void OnRecvCCGlobalBatch(const protocol::SharedLogMessage& message,
                              std::span<const char> payload) override;
-
     void OnRecvCCReadResponse(LocalOp* op,
                               const protocol::SharedLogMessage& message,
                               std::span<const char> payload);

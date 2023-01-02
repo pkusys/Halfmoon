@@ -24,6 +24,7 @@ namespace log {
 struct LocalOp {
     bool is_cc_op;
     protocol::SharedLogOpType type;
+    uint16_t func_id;
     uint16_t client_id;
     uint32_t user_logspace;
     uint32_t logspace_id;
@@ -35,16 +36,12 @@ struct LocalOp {
     uint64_t func_call_id;
     int64_t start_timestamp;
     // cc
-    uint64_t txn_localid;
-    std::unique_ptr<protocol::SharedLogMessage> message;
-    // protocol::SharedLogMessage* message;
+    uint64_t txn_localid; // deprecated
+    UserTagVec read_set;
+    UserTagVec write_set;
+    // std::unique_ptr<protocol::SharedLogMessage> message;
     UserTagVec user_tags;
     utils::AppendableBuffer data;
-
-    // LocalOp()
-    // {
-    //     message.reset(protocol::SharedLogMessageHelper::NewEmptySharedLogMessage());
-    // }
 };
 
 class EngineBase {
@@ -112,7 +109,6 @@ protected:
 
     virtual void HandleLocalCCTxnStart(LocalOp* op) = 0;
     virtual void HandleLocalCCTxnCommit(LocalOp* op) = 0;
-    // virtual void HandleLocalReadLock(LocalOp* op) = 0;
 
     void LocalOpHandler(LocalOp* op);
 
