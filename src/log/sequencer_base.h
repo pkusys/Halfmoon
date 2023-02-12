@@ -14,19 +14,9 @@ public:
     explicit SequencerBase(uint16_t node_id);
     virtual ~SequencerBase();
 
-    virtual void OnRecvReorderRequest(const protocol::SharedLogMessage& message,
-                                      std::span<const char> payload) = 0;
-    virtual void OnRecvTxnStartRequest(
-        const protocol::SharedLogMessage& message) = 0;
-
+protected:
     uint16_t my_node_id() const { return node_id_; }
 
-    bool SendSharedLogMessage(protocol::ConnType conn_type,
-                              uint16_t dst_node_id,
-                              const protocol::SharedLogMessage& message,
-                              std::span<const char> payload);
-
-protected:
     virtual void OnViewCreated(const View* view) = 0;
     virtual void OnViewFrozen(const View* view) = 0;
     virtual void OnViewFinalized(const FinalizedView* finalized_view) = 0;
@@ -36,11 +26,10 @@ protected:
         const protocol::SharedLogMessage& message) = 0;
     virtual void OnRecvShardProgress(const protocol::SharedLogMessage& message,
                                      std::span<const char> payload) = 0;
-    virtual void OnRecvNewMetaLogs(const protocol::SharedLogMessage& message,
-                                   std::span<const char> payload) = 0;
+    virtual void OnRecvNewMetaLog(const protocol::SharedLogMessage& message,
+                                  std::span<const char> payload) = 0;
 
     virtual void MarkNextCutIfDoable() = 0;
-    virtual void GrantTxnStartIds() = 0;
 
     void MessageHandler(const protocol::SharedLogMessage& message,
                         std::span<const char> payload);
@@ -80,6 +69,10 @@ private:
                                 uint16_t src_node_id,
                                 const protocol::SharedLogMessage& message,
                                 std::span<const char> payload);
+    bool SendSharedLogMessage(protocol::ConnType conn_type,
+                              uint16_t dst_node_id,
+                              const protocol::SharedLogMessage& message,
+                              std::span<const char> payload);
 
     server::EgressHub* CreateEgressHub(protocol::ConnType conn_type,
                                        uint16_t dst_node_id,

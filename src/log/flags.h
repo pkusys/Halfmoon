@@ -22,7 +22,8 @@ ABSL_DECLARE_FLAG(std::string, slog_storage_backend);
 ABSL_DECLARE_FLAG(int, slog_storage_bgthread_interval_ms);
 ABSL_DECLARE_FLAG(size_t, slog_storage_max_live_entries);
 
-ABSL_DECLARE_FLAG(size_t, cc_reorder_batch_size);
-ABSL_DECLARE_FLAG(size_t, cc_reorder_quickselect);
-ABSL_DECLARE_FLAG(int64_t, cc_reorder_max_interval_us);
-ABSL_DECLARE_FLAG(int, cc_reorder_max_interval_rel);
+// ABSL_DECLARE_FLAG(size_t, cc_reorder_batch_size);
+// ABSL_DECLARE_FLAG(size_t, cc_reorder_quickselect);
+// ABSL_DECLARE_FLAG(int64_t, cc_reorder_max_interval_us);
+// ABSL_DECLARE_FLAG(int, cc_reorder_max_interval_rel);
+ABSL_DECLARE_FLAG(bool, use_txn_engine);

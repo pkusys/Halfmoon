@@ -14,6 +14,7 @@ constexpr uint64_t kEmptyLogTag = 0;
 constexpr uint64_t kMaxLogSeqNum = 0xffff000000000000ULL;
 constexpr uint64_t kInvalidLogSeqNum = protocol::kInvalidLogSeqNum;
 constexpr uint64_t kInvalidLogTag = protocol::kInvalidLogTag;
+constexpr uint32_t kInvalidCondPos = std::numeric_limits<uint32_t>::max();
 
 struct SharedLogRequest {
     protocol::SharedLogMessage message;
@@ -46,25 +47,32 @@ struct LogMetaData {
     size_t data_size;
 };
 
-struct CCCommonHeader {
-    uint16_t cc_type;
-    uint32_t user_logspace;
-    uint32_t logspace_id;
-    uint64_t txn_localid; // view_id + engine_id + localid
-    // uint32_t seqnum_lowhalf; // for commit
-    // uint64_t localid;        // for lock
-    // uint64_t key;
-    size_t payload_size;
-};
-
 struct LogEntry {
     LogMetaData metadata;
     UserTagVec user_tags;
     std::string data;
 };
 
+struct CCLogMetaData {
+    // uint64_t localid;
+    // uint64_t seqnum;
+    uint16_t op_type;
+    uint16_t num_tags;
+    uint32_t cond_pos;
+    uint64_t cond_tag; // if not kInvalidLogTag, then this is cond op
+    // union {
+    //     uint64_t cond_tag;  // if not kInvalidLogTag, then this is cond op
+    //     uint64_t write_tag; // for async_write(cc_txn_write)
+    // };
+    // log_data size is implicit
+};
+
+static_assert(sizeof(CCLogMetaData) % sizeof(uint64_t) == 0,
+              "CC log metadata must be 8bytes-aligned");
+
 struct CCLogEntry {
-    CCCommonHeader common_header;
+    CCLogMetaData metadata;
+    UserTagVec user_tags;
     std::string data;
 };
 

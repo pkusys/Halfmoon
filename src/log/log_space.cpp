@@ -7,11 +7,40 @@
 #include "log/common.h"
 #include "log/engine_base.h"
 #include "log/flags.h"
+#include "proto/shared_log.pb.h"
 #include "utils/bits.h"
 #include <cstdint>
 #include <optional>
 
 namespace faas { namespace log {
+
+template <>
+size_t
+ProtoBuffer<MetaLogProto>::currentPosition(MetaLogProto* proto)
+{
+    return proto->metalog_seqnum();
+}
+
+template <>
+size_t
+ProtoBuffer<MetaLogProto>::nextPosition(MetaLogProto* proto)
+{
+    return proto->metalog_seqnum() + 1;
+}
+
+template <>
+size_t
+ProtoBuffer<PerEngineIndexProto>::currentPosition(PerEngineIndexProto* proto)
+{
+    return proto->start_seqnum();
+}
+
+template <>
+size_t
+ProtoBuffer<PerEngineIndexProto>::nextPosition(PerEngineIndexProto* proto)
+{
+    return proto->start_seqnum() + static_cast<size_t>(proto->log_indices_size());
+}
 
 MetaLogPrimary::MetaLogPrimary(const View* view, uint16_t sequencer_id)
     : LogSpaceBase(LogSpaceBase::kFullMode, view, sequencer_id),
@@ -183,57 +212,12 @@ LogProducer::LogProducer(uint16_t engine_id, const View* view, uint16_t sequence
     : LogSpaceBase(LogSpaceBase::kLiteMode, view, sequencer_id),
       next_localid_(bits::JoinTwo32(engine_id, 0))
 {
-    next_txn_localid_ =
-        bits::JoinTwo32(bits::JoinTwo16(view->id(), engine_id), 0) + 1;
     AddInterestedShard(engine_id);
     log_header_ = fmt::format("LogProducer[{}-{}]: ", view->id(), sequencer_id);
     state_ = kNormal;
 }
 
 LogProducer::~LogProducer() {}
-
-void
-LogProducer::RegisterTxnStart(LocalOp* caller_data, uint64_t* txn_id)
-{
-    HVLOG_F(1,
-            "call_id {} register local txn start with id {:#x}",
-            reinterpret_cast<const protocol::FuncCall*>(&caller_data->func_call_id)
-                ->call_id,
-            next_txn_localid_);
-    pending_txn_starts_.push_back({next_txn_localid_, caller_data});
-    *txn_id = next_txn_localid_++;
-    if (bits::LowHalf64(next_txn_localid_) == 0xffffffff) {
-        HLOG(WARNING) << "log producer txn id overflow";
-    }
-    // TODO: maybe send in a batch
-}
-
-void
-LogProducer::PollTxnStartResults(TxnStartResultVec* results)
-{
-    *results = std::move(pending_txn_start_results_);
-    pending_txn_start_results_.clear();
-    // results->swap(pending_txn_start_results_);
-}
-
-// NOTE: txn_id is the same as local_id for single op transactions
-// otherwise(e.g. lock), one txn may have multiple local_ids
-void
-LogProducer::RegisterCCOp(LocalOp* op, uint64_t* txn_localid)
-{
-    if (op->type == protocol::SharedLogOpType::CC_TXN_COMMIT) {
-        pending_cc_ops_[op->txn_localid] = op;
-        HVLOG_F(1, "Register commit op with txn id {:#x}", op->txn_localid);
-        return;
-    }
-    DCHECK(!pending_cc_ops_.contains(next_txn_localid_));
-    HVLOG_F(1,
-            "Local CC op with type {:#x} localid {:#x}",
-            static_cast<uint16_t>(op->type),
-            next_localid_);
-    pending_cc_ops_[next_txn_localid_] = op;
-    *txn_localid = next_txn_localid_++;
-}
 
 void
 LogProducer::LocalAppend(void* caller_data, uint64_t* localid)
@@ -249,116 +233,6 @@ LogProducer::PollAppendResults(AppendResultVec* results)
 {
     *results = std::move(pending_append_results_);
     pending_append_results_.clear();
-}
-
-void
-LogProducer::SetExpectedReplicas(uint64_t txn_localid, uint32_t num_replicas)
-{
-    DCHECK(pending_cc_ops_.contains(txn_localid));
-    DCHECK(!pending_replicas_.contains(txn_localid));
-    pending_replicas_[txn_localid] = num_replicas;
-}
-
-void*
-LogProducer::OnRecvReplicateOK(uint64_t txn_localid)
-{
-    DCHECK(pending_cc_ops_.contains(txn_localid));
-    pending_replicas_[txn_localid]--;
-    if (pending_replicas_[txn_localid] == 0) {
-        pending_replicas_.erase(txn_localid);
-        auto op_ptr = pending_cc_ops_[txn_localid];
-        // pending_cc_ops_.erase(txn_localid);
-        return op_ptr;
-    }
-    return nullptr;
-}
-
-void
-LogProducer::ApplyCCGlobalBatch(const CCGlobalBatchProto& batch_proto)
-{
-    HVLOG(1) << fmt::format("apply global batch {}, {} commits {} aborts",
-                            batch_proto.global_batch_id(),
-                            batch_proto.committed_txn_ids_size(),
-                            batch_proto.aborted_txn_ids_size());
-    // uint64_t global_batch_id = batch_proto.global_batch_id();
-    uint64_t start_seqnum = batch_proto.start_seqnum();
-    uint64_t end_seqnum = batch_proto.end_seqnum();
-    auto latest_txn_start = absl::c_lower_bound(
-        pending_txn_starts_,
-        batch_proto.latest_txn_start(),
-        [](const TxnStartRequest& a, uint64_t b) { return a.txn_id < b; });
-    if (latest_txn_start != pending_txn_starts_.end() &&
-        latest_txn_start->txn_id == batch_proto.latest_txn_start())
-    {
-        latest_txn_start++;
-        for (auto iter = pending_txn_starts_.begin(); iter != latest_txn_start;
-             iter++)
-        {
-            // pending_txn_start_results_.push_back(
-            //     {iter->caller_data, global_batch_id});
-            pending_txn_start_results_.push_back({iter->caller_data, end_seqnum});
-            // AddUnfinishedTxn(iter->txn_id, global_batch_id);
-        }
-        pending_txn_starts_.erase(pending_txn_starts_.begin(), latest_txn_start);
-    }
-    // commits
-    for (int i = 0; i < batch_proto.committed_txn_ids_size(); i++) {
-        uint64_t txn_id = batch_proto.committed_txn_ids(i);
-        uint64_t seqnum = start_seqnum + batch_proto.committed_offsets(i);
-        CHECK(pending_cc_ops_.contains(txn_id));
-        pending_txn_commit_batch_results_.push_back(
-            {pending_cc_ops_[txn_id], seqnum});
-        pending_cc_ops_.erase(txn_id);
-        // uint64_t snapshot = MarkTxnFinished(txn_id);
-        // if (snapshot != 0) {
-        //     finished_snapshot = snapshot;
-        // }
-    }
-    // aborts
-    for (int i = 0; i < batch_proto.aborted_txn_ids_size(); i++) {
-        uint64_t txn_id = batch_proto.aborted_txn_ids(i);
-        CHECK(pending_cc_ops_.contains(txn_id));
-        pending_txn_commit_batch_results_.push_back(
-            {pending_cc_ops_[txn_id], kInvalidLogSeqNum});
-        pending_cc_ops_.erase(txn_id);
-        // uint64_t snapshot = MarkTxnFinished(txn_id);
-        // if (snapshot != 0) {
-        //     finished_snapshot = snapshot;
-        // }
-    }
-    global_batch_position_++;
-}
-
-uint64_t
-LogProducer::ProvideCCGlobalBatch(const CCGlobalBatchProto& batch_proto)
-{
-    uint32_t batch_id = bits::LowHalf64(batch_proto.global_batch_id());
-    if (batch_id > global_batch_position_) {
-        auto batch_ptr = global_batch_proto_pool_.Get();
-        batch_ptr->CopyFrom(batch_proto);
-        pending_global_batches_[batch_id] = batch_ptr;
-        return finished_snapshot;
-    }
-    ApplyCCGlobalBatch(batch_proto);
-    auto iter = pending_global_batches_.begin();
-    while (iter != pending_global_batches_.end()) {
-        if (iter->first == global_batch_position_) {
-            ApplyCCGlobalBatch(*iter->second);
-            global_batch_proto_pool_.Return(iter->second);
-            iter = pending_global_batches_.erase(iter);
-        } else {
-            break;
-        }
-    }
-    return finished_snapshot;
-}
-
-void
-LogProducer::PollTxnCommitBatchResults(TxnCommitBatchResult* results)
-{
-    *results = std::move(pending_txn_commit_batch_results_);
-    pending_txn_commit_batch_results_.clear();
-    // results->swap(pending_txn_commit_batch_results_);
 }
 
 void
@@ -410,36 +284,9 @@ LogStorage::LogStorage(uint16_t storage_id, const View* view, uint16_t sequencer
     index_data_.set_logspace_id(identifier());
     log_header_ = fmt::format("LogStorage[{}-{}]: ", view->id(), sequencer_id);
     state_ = kNormal;
-    // has_cc_logs_to_flush = false;
-    max_live_log_entries = absl::GetFlag(FLAGS_slog_storage_max_live_entries);
-    max_live_cc_entries = absl::GetFlag(FLAGS_slog_storage_max_live_entries);
 }
 
 LogStorage::~LogStorage() {}
-
-bool
-LogStorage::StoreCCLogEntry(CCLogEntry* cc_entry)
-{
-    uint64_t txn_localid = cc_entry->common_header.txn_localid;
-    uint16_t engine_id = bits::LowHalf32(bits::HighHalf64(txn_localid));
-    HVLOG_F(1,
-            "Store cc log from engine {} with txn_localid {:#x}",
-            engine_id,
-            txn_localid);
-    if (!storage_node_->IsSourceEngineNode(engine_id)) {
-        HLOG_F(ERROR,
-               "Not storage node (node_id {}) for engine (node_id {})",
-               storage_node_->node_id(),
-               engine_id);
-        return false;
-    }
-    live_txn_localids_.push_back(txn_localid);
-    live_cc_log_entries_[txn_localid].reset(cc_entry);
-    // if (live_txn_localids_.size() > max_live_cc_entries) {
-    //     has_cc_logs_to_flush = true;
-    // }
-    return true;
-}
 
 bool
 LogStorage::Store(const LogMetaData& log_metadata,
@@ -467,15 +314,6 @@ LogStorage::Store(const LogMetaData& log_metadata,
     });
     AdvanceShardProgress(engine_id);
     return true;
-}
-
-std::optional<std::shared_ptr<CCLogEntry>>
-LogStorage::ReadCCLogEntry(const protocol::SharedLogMessage& request)
-{
-    if (live_cc_log_entries_.contains(request.txn_id)) {
-        return live_cc_log_entries_[request.txn_id];
-    }
-    return std::nullopt;
 }
 
 void
@@ -521,32 +359,6 @@ LogStorage::GrabLogEntriesForPersistence(
     DCHECK(!log_entries->empty());
     *new_position = live_seqnums_.back() + 1;
     // return true;
-}
-
-void
-LogStorage::GrabCCLogEntriesForPersistence(
-    std::vector<std::shared_ptr<CCLogEntry>>* cc_log_entries,
-    size_t* num_entries) const
-{
-    if (live_txn_localids_.size() > max_live_cc_entries) {
-        size_t num_to_flush = live_txn_localids_.size() - max_live_cc_entries;
-        for (size_t i = 0; i < num_to_flush; i++) {
-            uint64_t txn_localid = live_txn_localids_[i];
-            DCHECK(live_cc_log_entries_.contains(txn_localid));
-            cc_log_entries->push_back(live_cc_log_entries_.at(txn_localid));
-        }
-        *num_entries = num_to_flush;
-    }
-}
-
-void
-LogStorage::CCLogEntriesPersisted(size_t num_entries)
-{
-    for (size_t i = 0; i < num_entries; i++) {
-        uint64_t txn_localid = live_txn_localids_.front();
-        live_txn_localids_.pop_front();
-        live_cc_log_entries_.erase(txn_localid);
-    }
 }
 
 void
@@ -685,8 +497,8 @@ LogStorage::AdvanceShardProgress(uint16_t engine_id)
 void
 LogStorage::ShrinkLiveEntriesIfNeeded()
 {
-    // size_t max_size = absl::GetFlag(FLAGS_slog_storage_max_live_entries);
-    while (live_seqnums_.size() > max_live_log_entries &&
+    size_t max_size = absl::GetFlag(FLAGS_slog_storage_max_live_entries);
+    while (live_seqnums_.size() > max_size &&
            live_seqnums_.front() < persisted_seqnum_position_)
     {
         live_log_entries_.erase(live_seqnums_.front());

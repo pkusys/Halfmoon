@@ -5,11 +5,98 @@
 #include "log/log_space_base.h"
 #include "proto/shared_log.pb.h"
 #include "log/engine_base.h"
+#include "utils/object_pool.h"
 #include <cstdint>
 #include <deque>
 #include <memory>
 
 namespace faas { namespace log {
+
+template <class T>
+class ProtoBuffer {
+public:
+    // ProtoBuffer();
+    absl::Mutex buffer_mu_;
+    // always starts from 0; seqnum of proto should be lowhalf
+    size_t buffer_position_ = 0;
+    utils::SimpleObjectPool<T> proto_pool_;
+    absl::flat_hash_map</* buffer_position */ size_t, T*>
+        pending_protos_; // ABSL_GUARDED_BY(buffer_mu_)
+
+    static size_t currentPosition(T* proto);
+    static size_t nextPosition(T* proto);
+
+    void ProvideRaw(std::span<const char> payload);
+    void ProvideAllocated(T* proto);
+    std::optional<std::vector<T*>> PollBuffer();
+    void Recycle(std::vector<T*>& protos);
+};
+
+// template <>
+// ProtoBuffer<MetaLogProto>::ProtoBuffer()
+//     : buffer_position_(0)
+// {}
+
+template <class T>
+void
+ProtoBuffer<T>::ProvideRaw(std::span<const char> payload)
+{
+    T* proto = proto_pool_.Get();
+    proto->ParseFromArray(payload.data(), static_cast<int>(payload.size()));
+    if (currentPosition(proto) < buffer_position_ ||
+        pending_protos_.contains(currentPosition(proto)))
+    {
+        return;
+    }
+    pending_protos_[currentPosition(proto)] = proto;
+}
+
+template <class T>
+void
+ProtoBuffer<T>::ProvideAllocated(T* proto)
+{
+    if (currentPosition(proto) < buffer_position_ ||
+        pending_protos_.contains(currentPosition(proto)))
+    {
+        return;
+    }
+    T* buf = proto_pool_.Get();
+    buf->Swap(proto);
+    pending_protos_[currentPosition(buf)] = buf;
+}
+
+template <class T>
+std::optional<std::vector<T*>>
+ProtoBuffer<T>::PollBuffer()
+{
+    size_t pos = buffer_position_;
+    size_t cnt = 0;
+    while (pending_protos_.contains(pos)) {
+        pos = nextPosition(pending_protos_[pos]);
+        cnt++;
+    }
+    if (cnt == 0) {
+        return std::nullopt;
+    }
+    std::vector<T*> protos;
+    protos.reserve(cnt);
+    for (size_t i = 0; i < cnt; i++) {
+        protos.push_back(pending_protos_[buffer_position_]);
+        pending_protos_.erase(buffer_position_);
+        buffer_position_ = nextPosition(protos[i]);
+    }
+    return std::move(protos);
+}
+
+template <class T>
+void
+ProtoBuffer<T>::Recycle(std::vector<T*>& protos)
+{
+    absl::MutexLock lk(&buffer_mu_);
+    for (T* proto: protos) {
+        proto_pool_.Return(proto);
+    }
+}
 
 // Used in Sequencer
 class MetaLogPrimary final: public LogSpaceBase {
@@ -75,96 +162,6 @@ public:
     using AppendResultVec = absl::InlinedVector<AppendResult, 4>;
     void PollAppendResults(AppendResultVec* results);
 
-    uint64_t next_txn_localid_;
-    struct TxnStartRequest {
-        uint64_t txn_id;
-        void* caller_data;
-        // bool operator<(const TxnStartRequest& other) const
-        // {
-        //     return txn_id < other.txn_id;
-        // }
-    };
-    std::deque<TxnStartRequest> pending_txn_starts_;
-    void RegisterTxnStart(LocalOp* caller_data, uint64_t* txn_id);
-
-    struct UnfinishedTxn {
-        UnfinishedTxn* next;
-        bool finished;
-        uint64_t snapshot;
-        UnfinishedTxn(uint64_t batch_id)
-            : next(nullptr),
-              finished(false),
-              snapshot(batch_id)
-        {}
-    };
-    UnfinishedTxn *head, *tail;
-    absl::flat_hash_map</* txn_id */ uint64_t,
-                        /* UnfinishedTxn* */ UnfinishedTxn*>
-        unfinished_txns_;
-    uint64_t finished_snapshot = 0;
-
-    inline void AddUnfinishedTxn(uint64_t txn_id, uint64_t global_batch_id)
-    {
-        auto txn = new UnfinishedTxn(global_batch_id);
-        if (head == nullptr) {
-            head = tail = txn;
-        } else {
-            tail->next = txn;
-            tail = txn;
-        }
-        unfinished_txns_[txn_id] = txn;
-        VLOG(1) << "add unfinished txn " << txn_id << " at " << global_batch_id
-                << " total " << unfinished_txns_.size();
-    }
-
-    inline uint64_t MarkTxnFinished(uint64_t txn_id)
-    {
-        uint64_t snapshot = 0;
-        auto txn = unfinished_txns_.at(txn_id);
-        txn->finished = true;
-        unfinished_txns_.erase(txn_id);
-        auto ptr = head;
-        while (ptr != nullptr && ptr->finished) {
-            snapshot = ptr->snapshot;
-            head = ptr->next;
-            if (ptr == tail) {
-                tail = nullptr;
-            }
-            delete ptr;
-            ptr = head;
-        }
-        return snapshot;
-    }
-
-    absl::flat_hash_map</* localid */ uint64_t,
-                        /* caller_data */ void*>
-        pending_cc_ops_;
-    absl::flat_hash_map</* localid */ uint64_t,
-                        /* replica_cnt */ uint32_t>
-        pending_replicas_;
-    void RegisterCCOp(LocalOp* op, uint64_t* txn_localid);
-    void SetExpectedReplicas(uint64_t txn_localid, uint32_t num_replicas);
-    void* OnRecvReplicateOK(uint64_t txn_localid);
-
-    struct TxnStartResult {
-        void* caller_data;
-        // uint64_t global_batch_id;
-        uint64_t snapshot_seqnum;
-    };
-    using TxnStartResultVec = absl::InlinedVector<TxnStartResult, 64>;
-    TxnStartResultVec pending_txn_start_results_;
-    void PollTxnStartResults(TxnStartResultVec* results);
-
-    struct TxnCommitResult {
-        void* caller_data;
-        uint64_t seqnum;
-    };
-    using TxnCommitBatchResult = absl::InlinedVector<TxnCommitResult, 64>;
-    TxnCommitBatchResult pending_txn_commit_batch_results_;
-    void ApplyCCGlobalBatch(const CCGlobalBatchProto& batch_proto);
-    uint64_t ProvideCCGlobalBatch(const CCGlobalBatchProto& batch_proto);
-    void PollTxnCommitBatchResults(TxnCommitBatchResult* results);
-
 private:
     uint64_t next_localid_;
     absl::flat_hash_map</* localid */ uint64_t,
@@ -209,22 +206,6 @@ public:
 
     std::optional<IndexDataProto> PollIndexData();
     std::optional<std::vector<uint32_t>> GrabShardProgressForSending();
-
-    size_t max_live_log_entries;
-
-    // bool has_cc_logs_to_flush;
-    // size_t persisted_cc_log_offset;
-    size_t max_live_cc_entries;
-    std::deque<uint64_t> live_txn_localids_;
-    absl::flat_hash_map</* txn_localid */ uint64_t, std::shared_ptr<CCLogEntry>>
-        live_cc_log_entries_;
-    bool StoreCCLogEntry(CCLogEntry* cc_entry);
-    void GrabCCLogEntriesForPersistence(
-        std::vector<std::shared_ptr<CCLogEntry>>* cc_log_entries,
-        size_t* num_entries) const;
-    void CCLogEntriesPersisted(size_t num_entries);
-    std::optional<std::shared_ptr<CCLogEntry>> ReadCCLogEntry(
-        const protocol::SharedLogMessage& request);
 
 private:
     const View::Storage* storage_node_;

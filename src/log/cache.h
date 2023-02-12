@@ -22,12 +22,15 @@ public:
     void PutAuxData(uint64_t seqnum, std::span<const char> data);
     std::optional<std::string> GetAuxData(uint64_t seqnum);
 
-    void CCPut(CCLogEntry* cc_entry);
-    std::optional<CCLogEntry> CCGet(uint64_t txn_localid);
-    void CCPutAuxData(uint64_t global_batch_id,
-                      uint64_t key,
+    void CCPut(uint64_t localid, std::span<const char> log_data);
+    void CCPut(uint64_t seqnum, uint64_t key, std::span<const char> log_data);
+    std::optional<std::string> CCGet(uint64_t localid);
+    std::optional<std::string> CCGet(uint64_t seqnum, uint64_t key);
+
+    void CCPutAuxData(uint64_t seqnum,
+                      //   uint64_t key,
                       std::span<const char> aux_data);
-    std::optional<std::string> CCGetAuxData(uint64_t global_batch_id, uint64_t key);
+    std::optional<std::string> CCGetAuxData(uint64_t seqnum /* uint64_t key */);
 
 private:
     std::unique_ptr<tkrzw::CacheDBM> dbm_;

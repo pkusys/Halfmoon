@@ -26,7 +26,9 @@ StorageBase::StorageBase(uint16_t node_id)
       node_id_(node_id),
       db_(nullptr),
       background_thread_("BG", [this] { this->BackgroundThreadMain(); })
-{}
+{
+    use_txn_engine_ = absl::GetFlag(FLAGS_use_txn_engine);
+}
 
 StorageBase::~StorageBase() {}
 
@@ -52,7 +54,6 @@ StorageBase::SetupDB()
     std::string db_backend = absl::GetFlag(FLAGS_slog_storage_backend);
     if (db_backend == "rocksdb") {
         db_.reset(new RocksDBBackend(db_path_));
-        cc_db_.reset(new RocksDBBackend(cc_db_path_));
     } else if (db_backend == "tkrzw_hash") {
         db_.reset(new TkrzwDBMBackend(TkrzwDBMBackend::kHashDBM, db_path_));
     } else if (db_backend == "tkrzw_tree") {
@@ -75,9 +76,9 @@ StorageBase::SetupZKWatchers()
                 db_->InstallLogSpace(bits::JoinTwo16(view->id(), sequencer_id));
             }
         }
-        for (uint16_t engine_id: view->GetEngineNodes()) {
-            cc_db_->InstallLogSpace(bits::JoinTwo16(view->id(), engine_id));
-        }
+        // for (uint16_t engine_id: view->GetEngineNodes()) {
+        //     cc_db_->InstallLogSpace(bits::JoinTwo16(view->id(), engine_id));
+        // }
     });
     view_watcher_.SetViewFinalizedCallback(
         [this](const FinalizedView* finalized_view) {
@@ -103,11 +104,24 @@ StorageBase::MessageHandler(const SharedLogMessage& message,
     case SharedLogOpType::READ_AT:
         HandleReadAtRequest(message);
         break;
+    case SharedLogOpType::CC_READ_KVS:
+        HandleCCReadKVSRequest(message);
+        break;
+    case SharedLogOpType::CC_READ_LOG:
+        HandleCCReadLogRequest(message);
+        break;
     case SharedLogOpType::REPLICATE:
         HandleReplicateRequest(message, payload);
         break;
-    case SharedLogOpType::METALOGS:
-        OnRecvNewMetaLogs(message, payload);
+    case SharedLogOpType::APPEND:
+    case SharedLogOpType::CC_TXN_START:
+        HandleReplicateRequest(message, payload);
+        break;
+    case SharedLogOpType::CC_TXN_WRITE:
+        HandleCCTxnWriteRequest(message, payload);
+        break;
+    case SharedLogOpType::METALOG:
+        OnRecvNewMetaLog(message, payload);
         break;
     case SharedLogOpType::SET_AUXDATA:
         OnRecvLogAuxData(message, payload);
@@ -148,18 +162,6 @@ StorageBase::GetLogEntryFromDB(uint64_t seqnum)
     return log_entry_proto;
 }
 
-std::optional<CCLogEntry>
-StorageBase::GetCCLogEntryFromDB(uint64_t txn_id)
-{
-    auto encoded = cc_db_->Get(bits::HighHalf64(txn_id), bits::LowHalf64(txn_id));
-    if (!encoded.has_value()) {
-        return std::nullopt;
-    }
-    CCLogEntry cc_log_entry;
-    log_utils::DecodeCCLogEntry(&cc_log_entry, std::move(encoded.value()));
-    return cc_log_entry;
-}
-
 void
 StorageBase::PutLogEntryToDB(const LogEntry& log_entry)
 {
@@ -170,15 +172,38 @@ StorageBase::PutLogEntryToDB(const LogEntry& log_entry)
              STRING_AS_SPAN(data));
 }
 
-void
-StorageBase::PutCCLogEntryToDB(CCLogEntry& cc_entry)
+std::optional<CCLogEntry>
+StorageBase::GetCCLogEntryFromDB(uint32_t logspace_id, uint64_t localid)
 {
-    uint64_t txn_localid = cc_entry.common_header.txn_localid;
+    auto encoded = db_->Get(logspace_id, localid);
+    if (!encoded) {
+        return std::nullopt;
+    }
+    CCLogEntry log_entry;
+    log_utils::DecodeCCLogEntry(*encoded, log_entry);
+    return log_entry;
+}
+
+void
+StorageBase::PutCCLogEntryToDB(uint32_t logspace_id,
+                               uint64_t localid,
+                               const CCLogEntry& log_entry)
+{
     std::string encoded;
-    log_utils::EncodeCCLogEntry(&encoded, &cc_entry);
-    cc_db_->Put(bits::HighHalf64(txn_localid),
-                bits::LowHalf64(txn_localid),
-                STRING_AS_SPAN(encoded));
+    log_utils::EncodeCCLogEntry(encoded, log_entry);
+    db_->Put(logspace_id, localid, STRING_AS_SPAN(encoded));
+}
+
+std::optional<std::string>
+StorageBase::GetKVFromDB(uint64_t seqnum, uint64_t key)
+{
+    return db_->GetKV(seqnum, key);
+}
+
+void
+StorageBase::PutKVToDB(uint64_t seqnum, uint64_t key, const std::string& value)
+{
+    db_->PutKV(seqnum, key, STRING_AS_SPAN(value));
 }
 
 void
@@ -196,9 +221,32 @@ StorageBase::LogCacheGetAuxData(uint64_t seqnum)
 }
 
 void
-StorageBase::SendIndexData(const View* view, const IndexDataProto& index_data_proto)
+StorageBase::SLogSendIndexData(const View* view,
+                               const IndexDataProto& index_data_proto)
 {
     uint32_t logspace_id = index_data_proto.logspace_id();
+    DCHECK_EQ(view->id(), bits::HighHalf32(logspace_id));
+    const View::Sequencer* sequencer_node =
+        view->GetSequencerNode(bits::LowHalf32(logspace_id));
+    std::string serialized_data;
+    CHECK(index_data_proto.SerializeToString(&serialized_data));
+    SharedLogMessage message =
+        SharedLogMessageHelper::NewIndexDataMessage(logspace_id);
+    message.origin_node_id = node_id_;
+    message.payload_size = gsl::narrow_cast<uint32_t>(serialized_data.size());
+    for (uint16_t engine_id: sequencer_node->GetIndexEngineNodes()) {
+        SendSharedLogMessage(protocol::ConnType::STORAGE_TO_ENGINE,
+                             engine_id,
+                             message,
+                             STRING_AS_SPAN(serialized_data));
+    }
+}
+
+void
+StorageBase::CCSendIndexData(const View* view,
+                             uint32_t logspace_id,
+                             const PerStorageIndexProto& index_data_proto)
+{
     DCHECK_EQ(view->id(), bits::HighHalf32(logspace_id));
     const View::Sequencer* sequencer_node =
         view->GetSequencerNode(bits::LowHalf32(logspace_id));
@@ -258,7 +306,7 @@ StorageBase::OnRecvSharedLogMessage(int conn_type,
     SharedLogOpType op_type = SharedLogMessageHelper::GetOpType(message);
     DCHECK(
         (conn_type == kSequencerIngressTypeId &&
-         op_type == SharedLogOpType::METALOGS) ||
+         op_type == SharedLogOpType::METALOG) ||
         (conn_type == kEngineIngressTypeId && op_type == SharedLogOpType::READ_AT) ||
         (conn_type == kEngineIngressTypeId &&
          op_type == SharedLogOpType::REPLICATE) ||

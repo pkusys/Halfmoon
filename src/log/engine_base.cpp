@@ -1,5 +1,6 @@
 #include "log/engine_base.h"
 
+#include "absl/flags/internal/flag.h"
 #include "common/protocol.h"
 #include "common/time.h"
 #include "engine/engine.h"
@@ -27,7 +28,9 @@ EngineBase::EngineBase(engine::Engine* engine)
     : node_id_(engine->node_id_),
       engine_(engine),
       next_local_op_id_(0)
-{}
+{
+    use_txn_engine_ = absl::GetFlag(FLAGS_use_txn_engine);
+}
 
 EngineBase::~EngineBase() {}
 
@@ -45,7 +48,6 @@ EngineBase::Start()
     // Setup cache
     if (absl::GetFlag(FLAGS_slog_engine_enable_cache)) {
         log_cache_.emplace(absl::GetFlag(FLAGS_slog_engine_cache_cap_mb));
-        cc_log_cache_.emplace(absl::GetFlag(FLAGS_slog_engine_cache_cap_mb));
     }
 }
 
@@ -98,6 +100,8 @@ EngineBase::OnNewInternalFuncCall(const FuncCall& func_call,
         HLOG(FATAL) << "Cannot find parent FuncCall: "
                     << FuncCallHelper::DebugString(parent_func_call);
     }
+    // TODO: change metalog progress to seqnum
+    // and only increment it upon appends, reads never advance it
     FnCallContext ctx = fn_call_ctx_.at(parent_func_call.full_call_id);
     ctx.parent_call_id = parent_func_call.full_call_id;
     fn_call_ctx_[func_call.full_call_id] = std::move(ctx);
@@ -119,6 +123,7 @@ EngineBase::LocalOpHandler(LocalOp* op)
 {
     switch (op->type) {
     case SharedLogOpType::APPEND:
+    case SharedLogOpType::CC_TXN_START:
         HandleLocalAppend(op);
         break;
     case SharedLogOpType::READ_NEXT:
@@ -132,9 +137,9 @@ EngineBase::LocalOpHandler(LocalOp* op)
     case SharedLogOpType::SET_AUXDATA:
         HandleLocalSetAuxData(op);
         break;
-    case SharedLogOpType::CC_TXN_START:
-        HandleLocalCCTxnStart(op);
-        break;
+    // case SharedLogOpType::CC_TXN_START:
+    //     HandleLocalCCTxnStart(op);
+    //     break;
     case SharedLogOpType::CC_TXN_COMMIT:
         HandleLocalCCTxnCommit(op);
         break;
@@ -156,14 +161,13 @@ EngineBase::MessageHandler(const SharedLogMessage& message,
     case SharedLogOpType::INDEX_DATA:
         OnRecvNewIndexData(message, payload);
         break;
-    case SharedLogOpType::METALOGS:
-        OnRecvNewMetaLogs(message, payload);
+    case SharedLogOpType::METALOG:
+        OnRecvNewMetaLog(message, payload);
         break;
     case SharedLogOpType::RESPONSE:
+    case SharedLogOpType::CC_READ_KVS:
+    case SharedLogOpType::CC_READ_LOG:
         OnRecvResponse(message, payload);
-        break;
-    case SharedLogOpType::CC_GLOBAL_BATCH:
-        OnRecvCCGlobalBatch(message, payload);
         break;
     default:
         UNREACHABLE();
@@ -185,24 +189,9 @@ EngineBase::PopulateLogTagsAndData(const Message& message, LocalOp* op)
 }
 
 void
-EngineBase::PopulateCCOpPayload(const protocol::Message& message, LocalOp* op)
-{
-    std::span<const char> data = MessageHelper::GetInlineData(message);
-    op->data.AppendData(data);
-}
-
-// void
-// EngineBase::PopulateTxnCommitPayload(const Message& message, LocalOp* op)
-// {
-//     DCHECK(op->type == SharedLogOpType::CC_TXN_COMMIT);
-//     std::span<const char> data = MessageHelper::GetInlineData(message);
-//     op->data.AppendData(data);
-// }
-
-void
 EngineBase::OnMessageFromFuncWorker(const Message& message)
 {
-    protocol::FuncCall func_call = MessageHelper::GetFuncCall(message);
+    const protocol::FuncCall func_call = MessageHelper::GetFuncCall(message);
     FnCallContext ctx;
     {
         absl::ReaderMutexLock fn_ctx_lk(&fn_ctx_mu_);
@@ -219,6 +208,7 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
     op->start_timestamp = GetMonotonicMicroTimestamp();
     op->client_id = message.log_client_id;
     op->client_data = message.log_client_data;
+    // op->call_id = func_call.call_id;
     op->func_call_id = func_call.full_call_id;
     op->user_logspace = ctx.user_logspace;
     op->metalog_progress = ctx.metalog_progress;
@@ -227,10 +217,21 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
     op->query_tag = kInvalidLogTag;
     op->user_tags.clear();
     op->data.Reset();
-    op->is_cc_op = (message.flags & protocol::kMsgIsCCOpFlag) != 0;
+
+    // cond_tag is either the history log tag for a function instance
+    // or 0(kEmptyLogTag) for non-fault-tolerant functions
+    op->is_cond_op = (message.flags & protocol::kMsgIsCondOpFlag) != 0;
+    if (op->is_cond_op) {
+        op->cond_tag = message.log_tag;
+        op->cond_pos = message.cond_pos;
+    } else {
+        op->cond_tag = kEmptyLogTag;
+        op->cond_pos = kInvalidCondPos;
+    }
 
     switch (op->type) {
     case SharedLogOpType::APPEND:
+    case SharedLogOpType::CC_TXN_START:
         PopulateLogTagsAndData(message, op);
         break;
     case SharedLogOpType::READ_NEXT:
@@ -247,27 +248,16 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
         op->query_tag = message.log_tag;
         op->data.AppendData(MessageHelper::GetInlineData(message));
         break;
-    case SharedLogOpType::CC_TXN_START:
-        // op->txn_id = bits::JoinTwo32(my_node_id(), bits::LowHalf64(op->id));
-        op->data.AppendData(MessageHelper::GetInlineData(message));
-        break;
-    // case SharedLogOpType::CC_TXN_COMMIT:
-    //     // op->txn_id = bits::JoinTwo32(my_node_id(), message.txn_id_lowhalf);
-    //     op->seqnum = message.log_seqnum;
-    //     PopulateTxnCommitPayload(message, op);
-    //     break;
     case SharedLogOpType::CC_TXN_COMMIT:
-        op->txn_localid = message.txn_id;
-        PopulateCCOpPayload(message, op);
+        op->seqnum = message.log_seqnum;
+        // mark it as never used
+        op->localid = protocol::kInvalidLogLocalId;
+        PopulateLogTagsAndData(message, op);
         break;
-    case SharedLogOpType::CC_READ_LOCK:
-    case SharedLogOpType::CC_WRITE_LOCK:
-    case SharedLogOpType::CC_READ_UNLOCK:
-    case SharedLogOpType::CC_WRITE_UNLOCK:
-        // op->txn_id = bits::JoinTwo32(my_node_id(), message.txn_id_lowhalf);
-        // op->query_tag = message.log_tag;
-        // op->txn_localid = message.txn_id;
-        // PopulateCCOpPayload(message, op);
+    case SharedLogOpType::CC_TXN_WRITE:
+        op->seqnum = message.log_seqnum;
+        op->query_tag = message.log_tag;
+        op->data.AppendData(MessageHelper::GetInlineData(message));
         break;
     default:
         HLOG(FATAL) << "Unknown shared log op type: " << message.log_op;
@@ -288,7 +278,7 @@ EngineBase::OnRecvSharedLogMessage(int conn_type,
 {
     SharedLogOpType op_type = SharedLogMessageHelper::GetOpType(message);
     DCHECK((conn_type == kSequencerIngressTypeId &&
-            op_type == SharedLogOpType::METALOGS) ||
+            op_type == SharedLogOpType::METALOG) ||
            (conn_type == kEngineIngressTypeId &&
             op_type == SharedLogOpType::READ_NEXT) ||
            (conn_type == kEngineIngressTypeId &&
@@ -307,19 +297,27 @@ EngineBase::OnRecvSharedLogMessage(int conn_type,
     MessageHandler(message, payload);
 }
 
-void
+bool
 EngineBase::ReplicateCCLogEntry(const View* view,
-                                SharedLogMessage* message,
-                                std::span<const char> payload)
+                                SharedLogMessage& message,
+                                std::span<const uint64_t> user_tags,
+                                std::span<const char> log_data)
 {
-    message->origin_node_id = node_id_;
+    message.origin_node_id = node_id_;
+    message.payload_size = gsl::narrow_cast<uint32_t>(
+        user_tags.size() * sizeof(uint64_t) + log_data.size());
     const View::Engine* engine_node = view->GetEngineNode(node_id_);
     for (uint16_t storage_id: engine_node->GetStorageNodes()) {
-        engine_->SendSharedLogMessage(protocol::ConnType::ENGINE_TO_STORAGE,
-                                      storage_id,
-                                      *message,
-                                      payload);
+        if (!engine_->SendSharedLogMessage(protocol::ConnType::ENGINE_TO_STORAGE,
+                                           storage_id,
+                                           message,
+                                           VECTOR_AS_CHAR_SPAN(user_tags),
+                                           log_data))
+        {
+            return false;
+        }
     }
+    return true;
 }
 
 void
@@ -367,7 +365,8 @@ EngineBase::PropagateAuxData(const View* view,
 void
 EngineBase::FinishLocalOpWithResponse(LocalOp* op,
                                       Message* response,
-                                      uint64_t metalog_progress)
+                                      uint64_t metalog_progress,
+                                      bool recycle)
 {
     if (metalog_progress > 0) {
         absl::MutexLock fn_ctx_lk(&fn_ctx_mu_);
@@ -382,8 +381,10 @@ EngineBase::FinishLocalOpWithResponse(LocalOp* op,
     if (!engine_->SendFuncWorkerMessage(op->client_id, response)) {
         HLOG(FATAL) << "Failed to send response to client";
     }
-    // op->message.reset();
-    log_op_pool_.Return(op);
+    if (recycle) {
+        // RecycleLocalOp(op);
+        log_op_pool_.Return(op);
+    }
 }
 
 void
@@ -396,50 +397,56 @@ EngineBase::FinishLocalOpWithFailure(LocalOp* op,
 }
 
 void
-EngineBase::CCLogCachePut(CCLogEntry* cc_entry)
+EngineBase::CCLogCachePut(uint64_t localid, std::span<const char> log_data)
 {
     if (!log_cache_.has_value()) {
         return;
     }
-    // HVLOG_F(1,
-    //         "Store cache for cc log entry (txn_localid {:#x})",
-    //         cc_entry->common_header.txn_localid);
-    cc_log_cache_->CCPut(cc_entry);
-}
-
-std::optional<CCLogEntry>
-EngineBase::CCLogCacheGet(uint64_t txn_localid)
-{
-    // HVLOG_F(1, "try get cc log cache at txn_localid({:#x})", txn_localid);
-    return cc_log_cache_.has_value() ? cc_log_cache_->CCGet(txn_localid) :
-                                       std::nullopt;
+    // HVLOG_F(1, "Store cache for cc log entry (localid {:#x})", localid);
+    log_cache_->CCPut(localid, log_data);
 }
 
 void
-EngineBase::CCLogCachePutAuxData(uint64_t global_batch_id,
-                                 uint64_t key,
+EngineBase::CCLogCachePut(uint64_t seqnum, uint64_t key, std::span<const char> value)
+{
+    if (!log_cache_.has_value()) {
+        return;
+    }
+    // HVLOG_F(1, "Store cache for cc log entry (localid {:#x})", localid);
+    log_cache_->CCPut(seqnum, key, value);
+}
+
+std::optional<std::string>
+EngineBase::CCLogCacheGet(uint64_t localid)
+{
+    // HVLOG_F(1, "try get cc log cache at localid({:#x})", localid);
+    return log_cache_.has_value() ? log_cache_->CCGet(localid) : std::nullopt;
+}
+
+std::optional<std::string>
+EngineBase::CCLogCacheGet(uint64_t seqnum, uint64_t key)
+{
+    // HVLOG_F(1, "try get cc log cache at localid({:#x})", localid);
+    return log_cache_.has_value() ? log_cache_->CCGet(seqnum, key) : std::nullopt;
+}
+
+void
+EngineBase::CCLogCachePutAuxData(uint64_t seqnum,
+                                 //  uint64_t key,
                                  std::span<const char> aux_data)
 {
     if (!log_cache_.has_value()) {
         return;
     }
-    // HVLOG_F(1,
-    //         "Store aux data for global batch id {:#x} key {}",
-    //         global_batch_id,
-    //         key);
-    cc_log_cache_->CCPutAuxData(global_batch_id, key, aux_data);
+    // HVLOG_F(1, "Store aux data for seqnum {:#x} key {}", seqnum, key);
+    log_cache_->CCPutAuxData(seqnum, aux_data);
 }
 
 std::optional<std::string>
-EngineBase::CCLogCacheGetAuxData(uint64_t global_batch_id, uint64_t key)
+EngineBase::CCLogCacheGetAuxData(uint64_t seqnum /* uint64_t key */)
 {
-    // HVLOG_F(1,
-    //         "try get aux data for global batch id {:#x} key {}",
-    //         global_batch_id,
-    //         key);
-    return cc_log_cache_.has_value() ?
-               cc_log_cache_->CCGetAuxData(global_batch_id, key) :
-               std::nullopt;
+    // HVLOG_F(1, "try get aux data for seqnum {:#x} key {}", seqnum, key);
+    return log_cache_.has_value() ? log_cache_->CCGetAuxData(seqnum) : std::nullopt;
 }
 
 void
@@ -502,20 +509,11 @@ EngineBase::SendIndexReadRequest(const View::Sequencer* sequencer_node,
 }
 
 bool
-EngineBase::SendStorageCCReadRequest(LocalOp* op,
-                                     CCIndex::IndexEntry& idx_entry,
+EngineBase::SendStorageCCReadRequest(protocol::SharedLogMessage& request,
                                      const View::Engine* engine_node)
 {
     static constexpr int kMaxRetries = 3;
-
-    uint64_t txn_id = idx_entry.txn_id;
-    SharedLogMessage request =
-        SharedLogMessageHelper::NewCCReadAtMessage(op->logspace_id, txn_id);
-    request.user_metalog_progress = idx_entry.seqnum_;
-    // request.origin_node_id = result.original_query.origin_node_id;
-    // request.hop_times = result.original_query.hop_times + 1;
     request.origin_node_id = node_id_; // always use local engine
-    request.client_data = op->id;
     for (int i = 0; i < kMaxRetries; i++) {
         uint16_t storage_id = engine_node->PickStorageNode();
         bool success =

@@ -5,8 +5,7 @@
 namespace faas { namespace log {
 
 LogSpaceBase::LogSpaceBase(Mode mode, const View* view, uint16_t sequencer_id)
-    : global_batch_position_(0),
-      mode_(mode),
+    : mode_(mode),
       state_(kCreated),
       view_(view),
       sequencer_node_(view->GetSequencerNode(sequencer_id)),

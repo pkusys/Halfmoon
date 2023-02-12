@@ -16,7 +16,7 @@ using log::SharedLogRequest;
 using log::LogMetaData;
 using log::LogEntryProto;
 using log::MetaLogProto;
-using log::MetaLogsProto;
+// using log::MetaLogsProto;
 using protocol::SharedLogMessage;
 
 using protocol::SharedLogOpType;
@@ -68,26 +68,26 @@ FutureRequests::OnHoldRequest(uint16_t view_id, SharedLogRequest request)
     onhold_requests_[view_id].push_back(std::move(request));
 }
 
-MetaLogsProto
-MetaLogsFromPayload(std::span<const char> payload)
+MetaLogProto
+MetaLogFromPayload(std::span<const char> payload)
 {
-    MetaLogsProto metalogs_proto;
-    if (!metalogs_proto.ParseFromArray(payload.data(),
-                                       static_cast<int>(payload.size())))
+    MetaLogProto metalog_proto;
+    if (!metalog_proto.ParseFromArray(payload.data(),
+                                      static_cast<int>(payload.size())))
     {
         LOG(FATAL) << "Failed to parse MetaLogsProto";
     }
-    if (metalogs_proto.metalogs_size() == 0) {
-        LOG(FATAL) << "Empty MetaLogsProto";
-    }
-    uint32_t logspace_id = metalogs_proto.logspace_id();
-    for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs()) {
-        if (metalog_proto.logspace_id() != logspace_id) {
-            LOG(FATAL)
-                << "Meta logs in on MetaLogsProto must have the same logspace_id";
-        }
-    }
-    return metalogs_proto;
+    // if (metalogs_proto.metalogs_size() == 0) {
+    //     LOG(FATAL) << "Empty MetaLogsProto";
+    // }
+    // uint32_t logspace_id = metalogs_proto.logspace_id();
+    // for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs()) {
+    //     if (metalog_proto.logspace_id() != logspace_id) {
+    //         LOG(FATAL)
+    //             << "Meta logs in on MetaLogsProto must have the same logspace_id";
+    //     }
+    // }
+    return metalog_proto;
 }
 
 LogMetaData
@@ -162,89 +162,5 @@ PopulateMetaDataToMessage(const LogEntryProto& log_entry, SharedLogMessage* mess
     message->num_tags = gsl::narrow_cast<uint16_t>(log_entry.user_tags_size());
     message->localid = log_entry.localid();
 }
-
-void
-FillReplicateMsgWithOp(protocol::SharedLogMessage* message, log::LocalOp* op)
-{
-    message->op_type = static_cast<uint16_t>(SharedLogOpType::REPLICATE);
-    // cc_type is of no use in replicate, the storage needs not to understand it.
-    // instead, set up flag to notify storage that this is cc op, following cc path
-    message->flags |= protocol::kSLogIsCCOpFlag;
-    message->user_logspace = op->user_logspace;
-    message->logspace_id = op->logspace_id;
-    // cc specific
-    // message->cc_type = static_cast<uint16_t>(op->type);
-    // make sure this is the same as txn_id in commitheader
-    message->txn_localid = op->txn_localid;
-    message->payload_size = gsl::narrow_cast<uint32_t>(op->data.length());
-}
-
-void
-ReorderMsgFromReplicateMsg(protocol::SharedLogMessage* message, log::LocalOp* op)
-{
-    message->op_type = static_cast<uint16_t>(SharedLogOpType::REORDER);
-    message->cc_type = static_cast<uint16_t>(op->type);
-    switch (op->type) {
-    case SharedLogOpType::CC_TXN_COMMIT: // cc info is in the payload
-        {
-            CHECK(is_aligned<protocol::TxnCommitHeader>(op->data.data()));
-            auto commit_header =
-                reinterpret_cast<protocol::TxnCommitHeader*>(op->data.data());
-            message->payload_size = gsl::narrow_cast<uint32_t>(
-                sizeof(protocol::TxnCommitHeader) +
-                commit_header->read_set_size * sizeof(uint64_t) +
-                commit_header->write_set_size * sizeof(uint64_t));
-            break;
-        }
-    case SharedLogOpType::CC_READ_LOCK:
-    case SharedLogOpType::CC_WRITE_LOCK:
-    case SharedLogOpType::CC_READ_UNLOCK:
-    case SharedLogOpType::CC_WRITE_UNLOCK:
-        {
-            CHECK(is_aligned<protocol::TxnLockHeader>(op->data.data()));
-            auto lock_header =
-                reinterpret_cast<protocol::TxnLockHeader*>(op->data.data());
-            message->txn_id = lock_header->txn_id;
-            message->query_tag = lock_header->key;
-            message->payload_size = 0;
-            // TODO: add hint
-            break;
-        }
-    default:
-        LOG(FATAL) << "cc op not implemented";
-    }
-}
-
-// std::span<const char>
-// TxnCommitProtoFromOp(const log::LocalOp* op)
-// {
-//     DCHECK(op->type == protocol::SharedLogOpType::CC_TXN_COMMIT);
-//     DCHECK_GE(op->data.length(), sizeof(protocol::TxnCommitHeader));
-//     const char* ptr = op->data.data();
-//     auto header_ptr = reinterpret_cast<const protocol::TxnCommitHeader*>(ptr);
-//     DCHECK_EQ(op->data.length(),
-//               sizeof(protocol::TxnCommitHeader) +
-//                   header_ptr->read_set_size * sizeof(uint64_t) +
-//                   header_ptr->write_set_size * sizeof(uint64_t));
-//     ptr += sizeof(protocol::TxnCommitHeader);
-//     auto read_set_ptr = reinterpret_cast<const uint64_t*>(ptr);
-//     auto write_set_ptr = read_set_ptr + header_ptr->read_set_size;
-
-//     SLogCCEntry cc_entry;
-//     // The following fields are set in sharedlogmessage header, no need to set
-//     here
-//     // cc_entry.set_engine_id(bits::HighHalf64(op->txn_id));
-//     // cc_entry.set_txn_id(bits::LowHalf64(op->txn_id));
-//     cc_entry.set_type(SLogCCEntry::TXN_COMMIT);
-//     auto commit_msg = cc_entry.mutable_commit_msg();
-//     commit_msg->set_start_seqnum(bits::LowHalf64(op->seqnum));
-//     commit_msg->mutable_read_set()->Add(read_set_ptr, write_set_ptr);
-//     commit_msg->mutable_write_set()->Add(write_set_ptr,
-//                                          write_set_ptr +
-//                                          header_ptr->write_set_size);
-//     std::string proto_string;
-//     cc_entry.SerializeToString(&proto_string);
-//     return STRING_AS_SPAN(proto_string);
-// }
 
 }} // namespace faas::log_utils

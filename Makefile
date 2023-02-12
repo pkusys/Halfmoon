@@ -18,7 +18,8 @@ INCLUDES = -I$(SRC_PATH) -I./include -I./deps/out/include \
 	-I./deps/fmt/include \
 	-I./deps/GSL/include \
 	-I./deps/json/single_include \
-	-I./deps/xxHash
+	-I./deps/xxHash \
+	# -I./deps/ordered-map/include
 # Protobuf compiler
 PROTOC = ./deps/out/bin/protoc
 # General linker settings

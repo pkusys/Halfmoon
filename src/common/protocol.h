@@ -2,6 +2,7 @@
 
 #include "base/common.h"
 #include "common/time.h"
+#include "gsl/gsl_util"
 #include "utils/bits.h"
 #include <cstdint>
 #include <limits>
@@ -103,22 +104,17 @@ enum class SharedLogOpType : uint16_t {
     TRIM = 0x04,          // FuncWorker to Engine, Engine to Sequencer
     SET_AUXDATA = 0x05,   // FuncWorker to Engine, Engine to Storage
     READ_NEXT_B = 0x06,   // FuncWorker to Engine, Engine to Index
-    CC_TXN_START = 0x07,  // FuncWorker to Engine, Engine to Sequencer
-    CC_TXN_COMMIT = 0x08, // FuncWorker to Engine, Engine to Sequencer
-    // CC_TXN_ABORT  = 0x09, // FuncWorker to Engine, Engine to Sequencer
-    CC_READ_LOCK = 0x0a,    // FuncWorker to Engine, Engine to Sequencer
-    CC_WRITE_LOCK = 0x0b,   // FuncWorker to Engine, Engine to Sequencer
-    CC_READ_UNLOCK = 0x0c,  // FuncWorker to Engine, Engine to Sequencer
-    CC_WRITE_UNLOCK = 0x0d, // FuncWorker to Engine, Engine to Sequencer
-    READ_AT = 0x10,         // Index to Storage
-    REPLICATE = 0x11,       // Engine to Storage
-    INDEX_DATA = 0x12,      // Engine to Index
-    SHARD_PROG = 0x13,      // Storage to Sequencer
-    METALOGS = 0x14,        // Sequencer to Sequencer, Engine, Storage, Index
-    META_PROG = 0x15,       // Sequencer to Sequencer
-    REORDER = 0x16,         // Engine to Sequencer
-    CC_GLOBAL_BATCH = 0x17, // Sequencer to Engine
-    // REPLICATE_CC = 0x17,    // Engine to Storage
+    CC_TXN_START = 0x07,  // FuncWorker to Engine, Engine to Storage
+    CC_TXN_COMMIT = 0x08, // FuncWorker to Engine
+    CC_TXN_WRITE = 0x09,  // FuncWorker to Engine, Engine to Storage
+    CC_READ_LOG = 0x0a,   // Engine to Storage
+    CC_READ_KVS = 0x0b,   // Engine to Storage
+    READ_AT = 0x10,       // Index to Storage
+    REPLICATE = 0x11,     // Engine to Storage
+    INDEX_DATA = 0x12,    // Engine to Index
+    SHARD_PROG = 0x13,    // Storage to Sequencer
+    METALOG = 0x14,       // Sequencer to Sequencer, Engine, Storage, Index
+    META_PROG = 0x15,     // Sequencer to Sequencer
     RESPONSE = 0x20,
 };
 
@@ -130,54 +126,23 @@ enum class SharedLogResultType : uint16_t {
     TRIM_OK = 0x22,
     LOCALID = 0x23,
     AUXDATA_OK = 0x24,
-    REPLICATE_OK = 0x25,
+    // REPLICATE_OK = 0x25,
     // Error results
     BAD_ARGS = 0x30,
     DISCARDED = 0x31, // Log to append is discarded
     EMPTY = 0x32,     // Cannot find log entries satisfying requirements
     DATA_LOST = 0x33, // Failed to extract log data
     TRIM_FAILED = 0x34,
-    // CC
-    CACHED = 0x40,
-    ABORTED = 0x41, // Transaction aborted
-    // LOCK_OK     = 0x42, // Lock ok
-    // LOCK_FAILED = 0x43,
 };
-
-struct TxnStartHeader {
-    uint16_t read_set_size;
-    uint16_t write_set_size;
-};
-static_assert(sizeof(TxnStartHeader) == 4, "Unexpected Message size");
-
-// worker->engine: txn_id_lowhalf (high half engine_id, to be set by engine)
-// worker->engine: log_seqnum(high half log space id)
-// engine->sequencer: txn_id=local_id, high half is engine_id
-// engine->sequencer: seqnum=seqnum_lowhalf, high half is logspace_id, separate field
-struct TxnCommitHeader {
-    uint64_t txn_id;
-    uint64_t seqnum;
-    uint16_t read_set_size;
-    uint16_t write_set_size;
-    uint32_t _padding_;
-};
-static_assert(sizeof(TxnCommitHeader) == 24, "Unexpected Message size");
-
-struct TxnLockHeader {
-    uint64_t txn_id;
-    uint64_t key;
-};
-static_assert(sizeof(TxnLockHeader) == 16, "Unexpected Message size");
 
 constexpr uint64_t kInvalidLogTag = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t kInvalidLogLocalId = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t kInvalidLogSeqNum = std::numeric_limits<uint64_t>::max();
-// constexpr uint32_t kInvalidBatchSubIdx = std::numeric_limits<uint32_t>::max();
 
 constexpr uint32_t kFuncWorkerUseEngineSocketFlag = (1 << 0);
 constexpr uint32_t kUseFifoForNestedCallFlag = (1 << 1);
 constexpr uint32_t kAsyncInvokeFuncFlag = (1 << 2);
-constexpr uint32_t kMsgIsCCOpFlag = (1 << 3);
+constexpr uint32_t kMsgIsCondOpFlag = (1 << 3);
 
 struct Message {
     struct {
@@ -212,25 +177,15 @@ struct Message {
         };
     } __attribute__((packed));
 
-    union {
-        struct {
-            uint16_t log_num_tags;      // [36:38]
-            uint16_t log_aux_data_size; // [38:40]
-        } __attribute__((packed));
-        struct {
-            uint16_t read_set_size;  // [36:38]
-            uint16_t write_set_size; // [38:40]
-        } __attribute__((packed));
-    };
-
-    // uint16_t log_num_tags;      // [36:38]
-    // uint16_t log_aux_data_size; // [38:40]
+    uint16_t log_num_tags;      // [36:38]
+    uint16_t log_aux_data_size; // [38:40]
 
     uint64_t log_tag;         // [40:48]
     uint64_t log_client_data; // [48:56] will be preserved for response to clients
 
     // uint64_t _8_padding_8_;
-    uint64_t txn_id; // [56:64] Used in TXN_START(return), TXN_COMMIT, LOCK, etc.
+    uint32_t cond_pos; // [56:60] for cond op
+    uint32_t _4_padding_4_;
 
     char inline_data[__FAAS_MESSAGE_SIZE - __FAAS_CACHE_LINE_SIZE]
         __attribute__((aligned(__FAAS_CACHE_LINE_SIZE)));
@@ -290,14 +245,14 @@ struct GatewayMessage {
 static_assert(sizeof(GatewayMessage) == 16, "Unexpected GatewayMessage size");
 
 constexpr uint16_t kReadInitialFlag = (1 << 0);
-constexpr uint16_t kSLogIsCCOpFlag = (1 << 1);
+constexpr uint16_t kSLogIsCondOpFlag = (1 << 1);
+// constexpr uint16_t kSLogIsReplicateOpFlag = (1 << 2);
 
 struct SharedLogMessage {
     uint16_t op_type; // [0:2]
     union {           // [2:4]
         uint16_t op_result;
         uint16_t flags;
-        uint16_t cc_type;
     };
 
     uint16_t origin_node_id; // [4:6]
@@ -329,26 +284,26 @@ struct SharedLogMessage {
         struct {
             uint16_t num_tags;      // [24:26]
             uint16_t aux_data_size; // [26:28]
-            // uint32_t _5_padding_5_;
-            uint16_t read_set_size;  // [28:30]
-            uint16_t write_set_size; // [30:32]
+            // uint32_t _4_padding_4_;
+            uint32_t cond_pos; // [28:32]
         } __attribute__((packed));
     };
 
-    uint64_t user_metalog_progress; // [32:40]
+    union {
+        // Note: all history tags must be cond tags
+        // otherwise, will have to issue a slog read next to make sure the same op
+        // isn't performed twice
+        uint64_t cond_tag;              // [32:40]
+        uint64_t user_metalog_progress; // [32:40]
+    };
 
     union {
         uint64_t localid;      // [40:48]
-        uint64_t txn_id;       // [40:48] deprecated
         uint64_t query_seqnum; // [40:48]
         uint64_t trim_seqnum;  // [40:48]
     };
 
-    union {
-        uint64_t txn_localid;  // [48:56] deprecated
-        uint64_t client_data;  // [48:56]
-        uint64_t runtime_cost; // [48:56] us, in txn_start
-    };
+    uint64_t client_data; // [48:56]
 
     uint64_t prev_found_seqnum; // [56:64]
 
@@ -693,11 +648,6 @@ private:
 
 class SharedLogMessageHelper {
 public:
-    static SharedLogOpType GetCCType(const SharedLogMessage& message)
-    {
-        return static_cast<SharedLogOpType>(message.cc_type);
-    }
-
     static SharedLogOpType GetOpType(const SharedLogMessage& message)
     {
         return static_cast<SharedLogOpType>(message.op_type);
@@ -719,41 +669,6 @@ public:
         return message;
     }
 
-    static SharedLogMessage NewCCTxnStartMessage(uint64_t localid)
-    {
-        NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-        message.op_type = static_cast<uint16_t>(SharedLogOpType::CC_TXN_START);
-        message.localid = localid;
-        // message.txn_id = txn_id;
-        return message;
-    }
-
-    static SharedLogMessage NewCCGlobalBatchMessage(uint32_t logspace_id)
-    {
-        NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-        message.op_type = static_cast<uint16_t>(SharedLogOpType::CC_GLOBAL_BATCH);
-        message.logspace_id = logspace_id;
-        return message;
-    }
-
-    // static SharedLogMessage NewCCTxnCommitMessage(uint64_t txn_id, uint64_t
-    // seqnum)
-    // {
-    //     NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-    //     message.op_type = static_cast<uint16_t>(SharedLogOpType::CC_TXN_COMMIT);
-    //     message.txn_id = txn_id;
-    //     message.seqnum_lowhalf = bits::LowHalf64(seqnum);
-    //     return message;
-    // }
-
-    // static SharedLogMessage NewCCReplicateMessage(SharedLogOpType cc_type)
-    // {
-    //     NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-    //     message.op_type = static_cast<uint16_t>(SharedLogOpType::REPLICATE);
-    //     message.cc_type = static_cast<uint16_t>(cc_type);
-    //     return message;
-    // }
-
     static SharedLogMessage NewReplicateMessage()
     {
         NEW_EMPTY_SHAREDLOG_MESSAGE(message);
@@ -770,10 +685,10 @@ public:
         return message;
     }
 
-    static SharedLogMessage NewMetaLogsMessage(uint32_t logspace_id)
+    static SharedLogMessage NewMetaLogMessage(uint32_t logspace_id)
     {
         NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-        message.op_type = static_cast<uint16_t>(SharedLogOpType::METALOGS);
+        message.op_type = static_cast<uint16_t>(SharedLogOpType::METALOG);
         message.logspace_id = logspace_id;
         return message;
     }
@@ -821,13 +736,12 @@ public:
         return message;
     }
 
-    static SharedLogMessage NewCCReadAtMessage(uint32_t logspace_id, uint64_t txn_id)
+    static SharedLogMessage NewCCReadKVSResponse(
+        SharedLogResultType result = SharedLogResultType::READ_OK)
     {
         NEW_EMPTY_SHAREDLOG_MESSAGE(message);
-        message.op_type = static_cast<uint16_t>(SharedLogOpType::READ_AT);
-        message.flags |= kSLogIsCCOpFlag;
-        message.logspace_id = logspace_id;
-        message.txn_id = txn_id;
+        message.op_type = static_cast<uint16_t>(SharedLogOpType::CC_READ_KVS);
+        message.op_result = static_cast<uint16_t>(result);
         return message;
     }
 
@@ -844,17 +758,12 @@ public:
         return NewResponse(SharedLogResultType::READ_OK);
     }
 
-    static SharedLogMessage NewReplicateOkResponse()
-    {
-        return NewResponse(SharedLogResultType::REPLICATE_OK);
-    }
-
     static SharedLogMessage NewDataLostResponse()
     {
         return NewResponse(SharedLogResultType::DATA_LOST);
     }
 
-#undef NEW_EMPTY_SHAREDLOG_MESSAGE
+    // #undef NEW_EMPTY_SHAREDLOG_MESSAGE
 
 private:
     DISALLOW_IMPLICIT_CONSTRUCTORS(SharedLogMessageHelper);

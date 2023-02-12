@@ -39,12 +39,6 @@ public:
 
     void SerializeToProto(MetaLogsProto* meta_logs_proto);
 
-    utils::ProtobufMessagePool<CCGlobalBatchProto> global_batch_proto_pool_;
-    // std::vector<MetaLogProto*> applied_metalogs_;
-    std::map</* metalog_seqnum */ uint32_t, CCGlobalBatchProto*>
-        pending_global_batches_;
-    uint32_t global_batch_position_;
-
 protected:
     enum Mode { kLiteMode, kFullMode };
     enum State { kCreated, kNormal, kFrozen, kFinalized };

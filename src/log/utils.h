@@ -2,6 +2,7 @@
 
 #include "absl/synchronization/mutex.h"
 #include "base/logging.h"
+#include "common/protocol.h"
 #include "log/common.h"
 #include "log/engine_base.h"
 #include "log/view.h"
@@ -9,9 +10,16 @@
 #include "proto/shared_log.pb.h"
 #include "utils/lockable_ptr.h"
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <sys/types.h>
+#include <vector>
 
 namespace faas { namespace log_utils {
+
+using log::UserTagVec;
+using log::CCLogMetaData;
+using log::CCLogEntry;
 
 uint16_t GetViewId(uint64_t value);
 
@@ -59,130 +67,6 @@ private:
 
     DISALLOW_COPY_AND_ASSIGN(ThreadedMap);
 };
-
-log::MetaLogsProto MetaLogsFromPayload(std::span<const char> payload);
-
-log::LogMetaData GetMetaDataFromMessage(const protocol::SharedLogMessage& message);
-void SplitPayloadForMessage(const protocol::SharedLogMessage& message,
-                            std::span<const char> payload,
-                            std::span<const uint64_t>* user_tags,
-                            std::span<const char>* log_data,
-                            std::span<const char>* aux_data);
-
-void PopulateMetaDataToMessage(const log::LogMetaData& metadata,
-                               protocol::SharedLogMessage* message);
-void PopulateMetaDataToMessage(const log::LogEntryProto& log_entry,
-                               protocol::SharedLogMessage* message);
-
-// log::CCMetaData GetCCMetaDataFromMessage(const protocol::SharedLogMessage&
-// message); void PopulateCCMetaDataToMessage(const log::CCMetaData& cc_metadata,
-//                                  protocol::SharedLogMessage* message);
-
-template <class T>
-inline bool
-is_aligned(const void* ptr) noexcept
-{
-    auto iptr = reinterpret_cast<std::uintptr_t>(ptr);
-    return !(iptr % alignof(T));
-}
-
-void FillReplicateMsgWithOp(protocol::SharedLogMessage* message, log::LocalOp* op);
-void ReorderMsgFromReplicateMsg(protocol::SharedLogMessage* message,
-                                log::LocalOp* op);
-
-// void FillCCLogEntryWithOp(log::CCLogEntry* cc_entry, log::LocalOp* op);
-// void FillCCLogEntryWithReplicateMsg(log::CCLogEntry* cc_entry,
-//                                     protocol::SharedLogMessage* message,
-//                                     std::span<const char> payload);
-
-inline void
-FillCCLogEntryWithOp(log::CCLogEntry* cc_entry, log::LocalOp* op)
-{
-    auto header_ptr = &cc_entry->common_header;
-    // header_ptr->cc_type = static_cast<uint16_t>(op->type);
-    header_ptr->user_logspace = op->user_logspace;
-    header_ptr->logspace_id = op->logspace_id;
-    header_ptr->txn_localid = op->txn_localid;
-    header_ptr->payload_size = op->data.length();
-    cc_entry->data.assign(op->data.data(), op->data.length());
-}
-
-inline void
-FillCCLogEntryWithReplicateMsg(log::CCLogEntry* cc_entry,
-                               const protocol::SharedLogMessage* message,
-                               std::span<const char> payload)
-{
-    auto header_ptr = &cc_entry->common_header;
-    // header_ptr->cc_type = message->cc_type;
-    header_ptr->user_logspace = message->user_logspace;
-    header_ptr->logspace_id = message->logspace_id;
-    header_ptr->txn_localid = message->txn_localid;
-    header_ptr->payload_size = payload.size();
-    cc_entry->data.assign(payload.data(), payload.size());
-}
-
-inline void
-FillResponseMsgWithCCLogEntry(protocol::SharedLogMessage* message,
-                              log::CCLogEntry* cc_entry)
-{
-    auto header_ptr = &cc_entry->common_header;
-    // message->cc_type = header_ptr->cc_type;
-    message->user_logspace = header_ptr->user_logspace;
-    message->logspace_id = header_ptr->logspace_id;
-    // no need to fill local id, fix replicate message to use txn_id as client_data
-    // message->txn_localid = header_ptr->txn_localid;
-}
-
-inline void
-EncodeCCLogEntry(std::string* encoded, log::CCLogEntry* cc_entry)
-{
-    size_t header_size = sizeof(cc_entry->common_header);
-    size_t payload_size = cc_entry->data.size();
-    CHECK(payload_size == cc_entry->common_header.payload_size);
-    cc_entry->data.resize(header_size + payload_size);
-    *encoded = std::move(cc_entry->data);
-    auto ptr = encoded->data() + payload_size;
-    memcpy(ptr, &cc_entry->common_header, header_size);
-    CHECK(encoded->size() == header_size + payload_size);
-}
-
-inline void
-DecodeCCLogEntry(log::CCLogEntry* cc_entry, std::string encoded)
-{
-    size_t header_size = sizeof(cc_entry->common_header);
-    size_t payload_size = encoded.size() - header_size;
-    auto ptr = encoded.data() + payload_size;
-    // CHECK(is_aligned<log::CCCommonHeader>(ptr));
-    memcpy(&cc_entry->common_header, ptr, header_size);
-    CHECK(payload_size == cc_entry->common_header.payload_size);
-    encoded.resize(payload_size);
-    cc_entry->data = std::move(encoded);
-    CHECK(cc_entry->data.size() == payload_size);
-}
-
-inline void
-TxnCommitProtoFromReorderMsg(const protocol::SharedLogMessage& message,
-                             std::span<const char> payload,
-                             log::TxnCommitProto& commit_proto)
-{
-    // log::TxnCommitProto commit_proto;
-    commit_proto.Clear();
-    CHECK(is_aligned<protocol::TxnCommitHeader>(payload.data()));
-    auto commit_header =
-        reinterpret_cast<const protocol::TxnCommitHeader*>(payload.data());
-    commit_proto.set_txn_id(commit_header->txn_id);
-    commit_proto.set_start_seqnum(commit_header->seqnum);
-    CHECK(is_aligned<uint64_t>(payload.data() + sizeof(protocol::TxnCommitHeader)));
-    auto readset_ptr = reinterpret_cast<const uint64_t*>(
-        payload.data() + sizeof(protocol::TxnCommitHeader));
-    commit_proto.mutable_read_set()->Add(readset_ptr,
-                                         readset_ptr + commit_header->read_set_size);
-    auto writeset_ptr = readset_ptr + commit_header->read_set_size;
-    commit_proto.mutable_write_set()->Add(writeset_ptr,
-                                          writeset_ptr +
-                                              commit_header->write_set_size);
-    // return commit_proto;
-}
 
 // Start implementation of ThreadedMap
 template <class T>
@@ -283,6 +167,56 @@ ThreadedMap<T>::PollAllSorted(std::vector<std::pair<uint64_t, T*>>* values)
               });
 }
 
+log::MetaLogProto MetaLogFromPayload(std::span<const char> payload);
+
+log::LogMetaData GetMetaDataFromMessage(const protocol::SharedLogMessage& message);
+void SplitPayloadForMessage(const protocol::SharedLogMessage& message,
+                            std::span<const char> payload,
+                            std::span<const uint64_t>* user_tags,
+                            std::span<const char>* log_data,
+                            std::span<const char>* aux_data);
+
+void PopulateMetaDataToMessage(const log::LogMetaData& metadata,
+                               protocol::SharedLogMessage* message);
+void PopulateMetaDataToMessage(const log::LogEntryProto& log_entry,
+                               protocol::SharedLogMessage* message);
+
+template <class T>
+inline bool
+is_aligned(const void* ptr) noexcept
+{
+    auto iptr = reinterpret_cast<std::uintptr_t>(ptr);
+    return !(iptr % alignof(T));
+}
+
+template <class KeyType, class ValueType>
+class ThreadSafeHashBucket {
+public:
+    ThreadSafeHashBucket() = default;
+    bool Put(KeyType key, ValueType value)
+    {
+        absl::MutexLock lk(&mu_);
+        bool exists = buckets_.contains(key);
+        buckets_[key].push_back(value);
+        return exists;
+    }
+    void Poll(KeyType key, std::vector<ValueType>& result)
+    {
+        absl::MutexLock lk(&mu_);
+        if (buckets_.contains(key)) {
+            result = std::move(buckets_[key]);
+            buckets_.erase(key);
+        }
+    }
+
+private:
+    absl::Mutex mu_;
+    absl::flat_hash_map<KeyType, std::vector<ValueType>> buckets_
+        ABSL_GUARDED_BY(mu_);
+
+    DISALLOW_COPY_AND_ASSIGN(ThreadSafeHashBucket);
+};
+
 template <class T>
 void
 FinalizedLogSpace(LockablePtr<T> logspace_ptr,
@@ -296,6 +230,88 @@ FinalizedLogSpace(LockablePtr<T> logspace_ptr,
     if (!success) {
         LOG_F(FATAL, "Failed to finalize log space {}", bits::HexStr0x(logspace_id));
     }
+}
+
+// inline CCLogMetaData
+// CCMetaDataFromOp(log::LocalOp* op)
+// {
+//     auto metadata = CCLogMetaData{
+//         .op_type = op->type,
+//         .num_tags = op->user_tags.size(),
+//         .cond_pos = op->cond_pos,
+//         .cond_tag = op->cond_tag,
+//     };
+//     if (op->type == protocol::SharedLogOpType::CC_TXN_WRITE) {
+//         metadata.write_tag = op->query_tag;
+//     }
+// }
+
+// TODO: set an option in read to indicate if full log entry(in recovery) or only the
+// data is needed. For engine cache, only the data is stored
+
+inline void
+PopulateCCMetaData(const protocol::SharedLogMessage& message,
+                   CCLogMetaData* metadata)
+{
+    metadata->op_type = message.op_type;
+    metadata->num_tags = message.num_tags;
+    metadata->cond_pos = message.cond_pos;
+    metadata->cond_tag = message.cond_tag;
+    // omit txn write; these are persisted in KVS
+    // if (message.op_type ==
+    //     static_cast<uint16_t>(protocol::SharedLogOpType::CC_TXN_WRITE))
+    // {
+    //     metadata->write_tag = message.query_tag;
+    // }
+}
+
+inline void
+PopulateCCLogEntry(const protocol::SharedLogMessage& message,
+                   std::span<const char> payload,
+                   CCLogEntry* log_entry)
+{
+    PopulateCCMetaData(message, &log_entry->metadata);
+    const char* ptr = payload.data();
+    const uint64_t* tags_ptr = reinterpret_cast<const uint64_t*>(ptr);
+    log_entry->user_tags.insert(log_entry->user_tags.end(),
+                                tags_ptr,
+                                tags_ptr + message.num_tags);
+    size_t tags_data_size = message.num_tags * sizeof(uint64_t);
+    ptr += tags_data_size;
+    DCHECK(message.payload_size >= tags_data_size);
+    log_entry->data.assign(ptr, message.payload_size - tags_data_size);
+}
+
+// layout: data | tags | metadata
+// tags must be 8bytes-aligned
+inline void
+EncodeCCLogEntry(std::string& dst, const CCLogEntry& src)
+{
+    // cannot use move since the log entry may still be present in memory
+    // dst = std::move(src.data);
+    dst.resize(sizeof(CCLogMetaData) + src.user_tags.size() * sizeof(uint64_t) +
+               src.data.size());
+    dst.replace(0, src.data.size(), src.data);
+    char* ptr = dst.data();
+    memcpy(ptr, src.data.data(), src.data.size());
+    ptr += src.data.size();
+    memcpy(ptr, src.user_tags.data(), src.user_tags.size() * sizeof(uint64_t));
+    ptr += src.user_tags.size() * sizeof(uint64_t);
+    memcpy(ptr, &src.metadata, sizeof(CCLogMetaData));
+}
+
+inline void
+DecodeCCLogEntry(std::string& src, CCLogEntry& dst)
+{
+    char* metadata_ptr = src.data() + src.size() - sizeof(CCLogMetaData);
+    memcpy(&dst.metadata, metadata_ptr, sizeof(CCLogMetaData));
+    CHECK(is_aligned<uint64_t>(metadata_ptr)) << "tags must be 8bytes-aligned";
+    uint64_t* tags_ptr =
+        reinterpret_cast<uint64_t*>(metadata_ptr) - dst.metadata.num_tags;
+    dst.user_tags.assign(tags_ptr, tags_ptr + dst.metadata.num_tags);
+    src.resize(src.size() - sizeof(CCLogMetaData) -
+               dst.metadata.num_tags * sizeof(uint64_t));
+    dst.data = std::move(src);
 }
 
 }} // namespace faas::log_utils

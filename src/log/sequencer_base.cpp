@@ -57,10 +57,7 @@ SequencerBase::SetupTimers()
     CreatePeriodicTimer(
         kMetaLogCutTimerId,
         absl::Microseconds(absl::GetFlag(FLAGS_slog_global_cut_interval_us)),
-        [this]() {
-            this->MarkNextCutIfDoable();
-            this->GrantTxnStartIds();
-        });
+        [this]() { this->MarkNextCutIfDoable(); });
 }
 
 void
@@ -77,14 +74,8 @@ SequencerBase::MessageHandler(const SharedLogMessage& message,
     case SharedLogOpType::SHARD_PROG:
         OnRecvShardProgress(message, payload);
         break;
-    case SharedLogOpType::METALOGS:
-        OnRecvNewMetaLogs(message, payload);
-        break;
-    case SharedLogOpType::CC_TXN_START:
-        OnRecvTxnStartRequest(message);
-        break;
-    case SharedLogOpType::REORDER:
-        OnRecvReorderRequest(message, payload);
+    case SharedLogOpType::METALOG:
+        OnRecvNewMetaLog(message, payload);
         break;
     default:
         UNREACHABLE();
@@ -93,13 +84,15 @@ SequencerBase::MessageHandler(const SharedLogMessage& message,
 
 namespace {
 static std::string
-SerializedMetaLogs(const MetaLogProto& metalog)
+SerializedMetaLog(const MetaLogProto& metalog)
 {
-    MetaLogsProto metalogs_proto;
-    metalogs_proto.set_logspace_id(metalog.logspace_id());
-    metalogs_proto.add_metalogs()->CopyFrom(metalog);
+    // MetaLogsProto metalogs_proto;
+    // metalogs_proto.set_logspace_id(metalog.logspace_id());
+    // metalogs_proto.add_metalogs()->CopyFrom(metalog);
+    // std::string serialized;
+    // CHECK(metalogs_proto.SerializeToString(&serialized));
     std::string serialized;
-    CHECK(metalogs_proto.SerializeToString(&serialized));
+    CHECK(metalog.SerializeToString(&serialized));
     return serialized;
 }
 } // namespace
@@ -110,8 +103,8 @@ SequencerBase::ReplicateMetaLog(const View* view, const MetaLogProto& metalog)
     uint32_t logspace_id = metalog.logspace_id();
     DCHECK_EQ(bits::LowHalf32(logspace_id), my_node_id());
     SharedLogMessage message =
-        SharedLogMessageHelper::NewMetaLogsMessage(logspace_id);
-    std::string payload = SerializedMetaLogs(metalog);
+        SharedLogMessageHelper::NewMetaLogMessage(logspace_id);
+    std::string payload = SerializedMetaLog(metalog);
     message.origin_node_id = node_id_;
     message.payload_size = gsl::narrow_cast<uint32_t>(payload.size());
     const View::Sequencer* sequencer_node = view->GetSequencerNode(my_node_id());
@@ -160,8 +153,8 @@ SequencerBase::PropagateMetaLog(const View* view, const MetaLogProto& metalog)
         UNREACHABLE();
     }
     SharedLogMessage message =
-        SharedLogMessageHelper::NewMetaLogsMessage(metalog.logspace_id());
-    std::string payload = SerializedMetaLogs(metalog);
+        SharedLogMessageHelper::NewMetaLogMessage(metalog.logspace_id());
+    std::string payload = SerializedMetaLog(metalog);
     message.origin_node_id = node_id_;
     message.payload_size = gsl::narrow_cast<uint32_t>(payload.size());
     for (uint16_t engine_id: engine_nodes) {
@@ -222,7 +215,7 @@ SequencerBase::OnRecvSharedLogMessage(int conn_type,
 {
     SharedLogOpType op_type = SharedLogMessageHelper::GetOpType(message);
     DCHECK((conn_type == kSequencerIngressTypeId &&
-            op_type == SharedLogOpType::METALOGS) ||
+            op_type == SharedLogOpType::METALOG) ||
            (conn_type == kSequencerIngressTypeId &&
             op_type == SharedLogOpType::META_PROG) ||
            (conn_type == kEngineIngressTypeId && op_type == SharedLogOpType::TRIM) ||

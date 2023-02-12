@@ -1,25 +1,32 @@
 #include "log/engine.h"
 
+#include "absl/container/inlined_vector.h"
 #include "absl/synchronization/mutex.h"
 #include "base/logging.h"
 #include "base/std_span.h"
 #include "common/protocol.h"
 #include "engine/engine.h"
 #include "fmt/core.h"
+#include "gsl/gsl_util"
 #include "log/common.h"
 #include "log/engine_base.h"
 #include "log/flags.h"
 #include "log/index.h"
 #include "log/log_space.h"
 #include "log/utils.h"
+#include "log/view.h"
 #include "proto/shared_log.pb.h"
 #include "utils/bits.h"
 #include "utils/random.h"
+#include "zookeeper/zookeeper.jute.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace faas { namespace log {
 
@@ -31,28 +38,270 @@ using protocol::SharedLogOpType;
 using protocol::SharedLogResultType;
 
 TxnEngine::TxnEngine(const View* view, uint16_t engine_id, uint16_t sequencer_id)
-    : engine_id_(engine_id),
+    : view_(view),
+      engine_id_(engine_id),
       next_localid_(bits::JoinTwo32(engine_id, 0))
 {
     const View::NodeIdVec& engine_node_ids = view->GetEngineNodes();
-    size_t idx = static_cast<size_t>(absl::c_find(engine_node_ids, engine_id) -
-                                     engine_node_ids.begin());
-    DCHECK_LT(idx, engine_node_ids.size());
-    engine_idx_ = idx;
-    const View::Engine* engine_node = view->GetEngineNode(engine_id);
-    replica_count_ = engine_node->GetStorageNodes().size();
+    engine_idx_ = static_cast<int>(absl::c_find(engine_node_ids, engine_id) -
+                                   engine_node_ids.begin());
+    DCHECK_LT(static_cast<size_t>(engine_idx_), engine_node_ids.size());
+    // const View::Engine* engine_node = view->GetEngineNode(engine_id);
+    // replica_count_ = engine_node->GetStorageNodes().size();
     logspace_id_ = bits::JoinTwo16(view->id(), sequencer_id);
 }
 
-TxnProgress*
-TxnEngine::RegisterTxnStart(LocalOp* op)
+uint64_t
+TxnEngine::RegisterOp(LocalOp* op)
 {
-    absl::MutexLock lk(&start_mu_);
+    absl::MutexLock lk(&append_mu_);
     uint64_t localid = next_localid_++;
-    auto txn_progress = txn_progress_pool_.Get();
-    pending_txn_starts_[localid] = op;
-    running_txns_[localid] = txn_progress;
-    return txn_progress;
+    pending_ops_[localid] = op;
+    op->localid = localid;
+    return localid;
+}
+
+void
+TxnEngine::RegisterTxnCommitOp(LocalOp* op)
+{
+    absl::MutexLock lk(&append_mu_);
+    pending_txns_[bits::LowHalf64(op->seqnum)].reset(new TxnProgress(op));
+}
+
+// std::optional<std::vector<MetaLogProto*>>
+// TxnEngine::ProvideRawMetaLog(std::span<const char> payload)
+// {
+//     absl::MutexLock lk(&metalog_mu_);
+//     auto metalog_proto = metalog_pool_.Get();
+//     metalog_proto->ParseFromArray(payload.data(),
+//     static_cast<int>(payload.size()));
+//     pending_metalogs_[metalog_proto->metalog_seqnum()] = metalog_proto;
+//     uint32_t metalog_seqnum = metalog_seqnum_;
+//     while (pending_metalogs_.contains(metalog_seqnum)) {
+//         metalog_seqnum++;
+//     }
+//     if (metalog_seqnum == metalog_seqnum_) {
+//         return std::nullopt;
+//     }
+//     std::vector<MetaLogProto*> metalogs(metalog_seqnum - metalog_seqnum_);
+//     for (uint32_t i = 0; i < metalogs.size(); i++) {
+//         metalogs[i] = pending_metalogs_[metalog_seqnum_ + i];
+//         pending_metalogs_.erase(metalog_seqnum_ + i);
+//     }
+//     metalog_seqnum_ = metalog_seqnum;
+//     return metalogs;
+// }
+
+void
+TxnEngine::ApplyMetaLogs(std::vector<MetaLogProto*>& metalog_protos)
+{
+    // size_t num_ops = 0;
+    // for (MetaLogProto* metalog_proto: metalog_protos) {
+    //     num_ops += metalog_proto->new_logs_proto().shard_deltas(engine_idx_);
+    // }
+    // finished_ops_.reserve(num_ops);
+    // absl::MutexLock lk(&append_mu_);
+    for (MetaLogProto* metalog_proto: metalog_protos) {
+        DCHECK(metalog_proto->logspace_id() == logspace_id_);
+        const auto& progress_vec = metalog_proto->new_logs_proto();
+        uint64_t start_seqnum =
+            bits::JoinTwo32(logspace_id_, progress_vec.start_seqnum());
+        CHECK(progress_vec.shard_deltas_size() ==
+              static_cast<int>(view_->num_engine_nodes()));
+        for (int i = 0; i < progress_vec.shard_deltas_size(); i++) {
+            if (i != engine_idx_) {
+                start_seqnum += progress_vec.shard_deltas(i);
+                continue;
+            }
+            uint64_t start_localid =
+                bits::JoinTwo32(engine_id_, progress_vec.shard_starts(i));
+            for (uint32_t j = 0; j < progress_vec.shard_deltas(i); j++) {
+                FinishOp(start_localid + j, start_seqnum + j);
+            }
+        }
+    }
+    // finished_ops.swap(finished_ops_);
+}
+
+void
+TxnEngine::FinishOp(uint64_t localid, uint64_t seqnum, bool check_cond)
+{
+    if (!pending_ops_.contains(localid)) {
+        return;
+    }
+    LocalOp* op = pending_ops_.at(localid);
+    if (check_cond && op->is_cond_op) {
+        return;
+    }
+    pending_ops_.erase(localid);
+    finished_ops_.push_back(op);
+    // Note: async_write has already returned to caller, no need to call
+    // FinishOpWithResponse
+    if (op->type == protocol::SharedLogOpType::CC_TXN_WRITE) {
+        auto& txn_progress = pending_txns_[bits::LowHalf64(op->seqnum)];
+        LocalOp* commit_op = txn_progress->finishOp();
+        if (commit_op != nullptr) {
+            finished_ops_.push_back(commit_op);
+        }
+    } else {
+        op->seqnum = seqnum;
+    }
+}
+
+void
+TxnEngine::FinishCondOps(CondOpResultVec& cond_op_results)
+{
+    // absl::MutexLock lk(&append_mu_);
+    for (auto& [localid, seqnum]: cond_op_results) {
+        FinishOp(localid, seqnum, false);
+    }
+}
+
+void
+TxnEngine::PollFinishedOps(FinishedOpVec& finished_ops)
+{
+    finished_ops.swap(finished_ops_);
+}
+
+// void
+// TxnEngine::RecycleMetaLogs(std::vector<MetaLogProto*>& metalog_protos)
+// {
+//     absl::MutexLock lk(&metalog_mu_);
+//     for (MetaLogProto* metalog_proto: metalog_protos) {
+//         metalog_pool_.Return(metalog_proto);
+//     }
+// }
+
+void
+TxnEngine::ApplyIndices(std::vector<PerEngineIndexProto*>& engine_indices)
+{
+    for (auto engine_index: engine_indices) {
+        // uint64_t start_seqnum =
+        //     bits::JoinTwo32(logspace_id_, engine_index.start_seqnum());
+        uint64_t start_localid = engine_index->start_localid();
+        for (int i = 0; i < engine_index->log_indices_size(); i++) {
+            auto& log_index = engine_index->log_indices(i);
+            ApplyIndex(log_index, start_localid + static_cast<uint64_t>(i));
+        }
+    }
+    // TODO: check pending reads
+    auto iter = pending_queries_.begin();
+    uint32_t indexed_seqnum = indexed_seqnum_.load();
+    while (iter != pending_queries_.end()) {
+        if (iter->first >= indexed_seqnum) {
+            break;
+        }
+        LocalOp* op = iter->second;
+        IndexInfo index_info = LookUpCurrentIndex(op);
+        pending_query_results_.push_back(IndexQueryResult{index_info, op});
+    }
+}
+
+void
+TxnEngine::ApplyIndex(const PerLogIndexProto& log_index, uint64_t localid)
+{
+    uint16_t engine_id = gsl::narrow_cast<uint16_t>(bits::HighHalf64(localid));
+    uint32_t seqnum_lowhalf = indexed_seqnum_++;
+    // txn write has no tags
+    if (log_index.user_tags_size() == 0 && log_index.cond_tag() == kEmptyLogTag) {
+        return;
+    }
+    if (log_index.cond_tag() != kEmptyLogTag) {
+        size_t pos = seqnums_by_tag_[log_index.cond_tag()].size();
+        bool cond_ok = pos == log_index.cond_pos();
+        if (engine_id == engine_id_) {
+            cond_op_results_.push_back(CondOpResult{
+                .localid = localid,
+                .seqnum = cond_ok ? bits::JoinTwo32(logspace_id_, seqnum_lowhalf) :
+                                    kInvalidLogSeqNum,
+            });
+        }
+        if (!cond_ok) {
+            return;
+        }
+        seqnums_by_tag_[log_index.cond_tag()].push_back(seqnum_lowhalf);
+    }
+    for (uint64_t user_tag: log_index.user_tags()) {
+        seqnums_by_tag_[user_tag].push_back(seqnum_lowhalf);
+    }
+    seqnum_info_[seqnum_lowhalf] = IndexInfo{
+        .is_txn = log_index.is_txn(),
+        .engine_id = engine_id,
+        .localid_lowhalf = bits::LowHalf64(localid),
+        .cond_tag = log_index.cond_tag(),
+    };
+}
+
+void
+TxnEngine::PollCondOpResults(CondOpResultVec& cond_op_results)
+{
+    cond_op_results.swap(cond_op_results_);
+}
+
+void
+TxnEngine::PollIndexQueryResults(IndexQueryResultVec& query_results)
+{
+    query_results.swap(pending_query_results_);
+}
+
+// NOTE: txns and functions should read prev with snapshot-1
+std::optional<TxnEngine::IndexInfo>
+TxnEngine::LookUp(LocalOp* op)
+{
+    uint32_t indexed_seqnum_lowhalf = indexed_seqnum_.load();
+    // currently not supporting snapshot and single obj read prev
+    // snapshot(read-only txn) and single obj(non-txn) returns the current tail
+    if (bits::JoinTwo32(logspace_id_, indexed_seqnum_lowhalf) <= op->seqnum) {
+        absl::MutexLock lk(&index_mu_);
+        return LookUpFutureIndex(op);
+    }
+    absl::ReaderMutexLock lk(&index_mu_);
+    return LookUpCurrentIndex(op);
+}
+
+TxnEngine::IndexInfo
+TxnEngine::LookUpCurrentIndex(LocalOp* op)
+{
+    // absl::ReaderMutexLock lk(&index_mu_);
+    DCHECK(logspace_id_ == bits::HighHalf64(op->seqnum));
+    // currently not supporting snapshot and single obj read
+    DCHECK(op->query_tag != kEmptyLogTag);
+    if (!seqnums_by_tag_.contains(op->query_tag)) {
+        op->seqnum = kInvalidLogSeqNum;
+        return IndexInfo{};
+    }
+    uint32_t query_seqnum_lowhalf = bits::LowHalf64(op->seqnum);
+    auto& index_of_tag = seqnums_by_tag_.at(op->query_tag);
+    auto iter = absl::c_upper_bound(
+        index_of_tag,
+        query_seqnum_lowhalf,
+        [](uint32_t query_seqnum_lowhalf, uint32_t index_seqnum) {
+            return query_seqnum_lowhalf < index_seqnum;
+        });
+    if (iter == index_of_tag.begin()) {
+        op->seqnum = kInvalidLogSeqNum;
+        return IndexInfo{};
+    }
+    uint32_t result_seqnum_lowhalf = *(--iter);
+    op->seqnum = bits::JoinTwo32(logspace_id_, result_seqnum_lowhalf);
+    return seqnum_info_[result_seqnum_lowhalf];
+}
+
+std::optional<TxnEngine::IndexInfo>
+TxnEngine::LookUpFutureIndex(LocalOp* op)
+{
+    // absl::MutexLock lk(&index_mu_);
+    DCHECK(logspace_id_ == bits::HighHalf64(op->seqnum));
+    // currently not supporting snapshot and single obj read prev
+    // snapshot(read-only txn) and single obj(non-txn) returns the current tail
+    DCHECK(op->query_tag != kEmptyLogTag);
+    uint32_t indexed_seqnum_lowhalf = indexed_seqnum_.load();
+    uint32_t query_seqnum_lowhalf = bits::LowHalf64(op->seqnum);
+    if (indexed_seqnum_lowhalf <= query_seqnum_lowhalf) {
+        pending_queries_.insert(std::make_pair(query_seqnum_lowhalf, op));
+        return std::nullopt;
+    }
+    return LookUpCurrentIndex(op);
 }
 
 Engine::Engine(engine::Engine* engine)
@@ -87,8 +336,10 @@ Engine::OnViewCreated(const View* view)
                 if (engine_node->HasIndexFor(sequencer_id)) {
                     index_collection_.InstallLogSpace(
                         std::make_unique<Index>(view, sequencer_id));
-                    cc_index_collection_.InstallLogSpace(
-                        std::make_unique<CCIndex>(view, sequencer_id));
+                    // cc_index_collection_.InstallLogSpace(
+                    //     std::make_unique<CCIndex>(view, sequencer_id));
+                    txn_engine_.reset(
+                        new TxnEngine(view, my_node_id(), sequencer_id));
                 }
             }
         }
@@ -200,29 +451,31 @@ BuildLocalReadOKResponse(const LogEntry& log_entry)
                                     STRING_AS_SPAN(log_entry.data));
 }
 
-static Message
-BuildLocalCCReadCachedResponse(uint64_t seqnum, std::span<const char> aux_data)
-{
-    Message response =
-        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::CACHED, seqnum);
-    if (aux_data.size() > MESSAGE_INLINE_DATA_SIZE) {
-        LOG_F(FATAL, "Log data too large: size={}", aux_data.size());
-    }
-    MessageHelper::AppendInlineData(&response, aux_data);
-    return response;
-}
+// static Message
+// BuildLocalCCReadCachedResponse(uint64_t seqnum, std::span<const char> aux_data)
+// {
+//     Message response =
+//         MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::CACHED,
+//         seqnum);
+//     if (aux_data.size() > MESSAGE_INLINE_DATA_SIZE) {
+//         LOG_F(FATAL, "Log data too large: size={}", aux_data.size());
+//     }
+//     MessageHelper::AppendInlineData(&response, aux_data);
+//     return response;
+// }
 
-static Message
-BuildLocalCCReadOkResponse(uint64_t seqnum, std::span<const char> log_data)
-{
-    Message response =
-        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK, seqnum);
-    if (log_data.size() > MESSAGE_INLINE_DATA_SIZE) {
-        LOG_F(FATAL, "Log data too large: size={}", log_data.size());
-    }
-    MessageHelper::AppendInlineData(&response, log_data);
-    return response;
-}
+// static Message
+// BuildLocalCCReadOkResponse(uint64_t seqnum, std::span<const char> log_data)
+// {
+//     Message response =
+//         MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK,
+//         seqnum);
+//     if (log_data.size() > MESSAGE_INLINE_DATA_SIZE) {
+//         LOG_F(FATAL, "Log data too large: size={}", log_data.size());
+//     }
+//     MessageHelper::AppendInlineData(&response, log_data);
+//     return response;
+// }
 
 // static Message
 // BuildLocalCCReadOkResponse(const CCLogEntry& cc_log_entry)
@@ -245,104 +498,81 @@ BuildLocalCCReadOkResponse(uint64_t seqnum, std::span<const char> log_data)
         }                                                                          \
     } while (0)
 
-// void
-// Engine::HandleLocalCCTxnStart(LocalOp* op)
-// {
-//     DCHECK(op->type == SharedLogOpType::CC_TXN_START);
-//     const View* view = nullptr;
-//     {
-//         absl::ReaderMutexLock view_lk(&view_mu_);
-//         if (!current_view_active_) {
-//             HLOG(WARNING) << "Current view not active";
-//             FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-//             return;
-//         }
-//         view = current_view_;
-//         op->logspace_id = view->LogSpaceIdentifier(op->user_logspace);
-//         auto producer_ptr =
-//         producer_collection_.GetLogSpaceChecked(op->logspace_id);
-//         {
-//             // TODO: separate this from log producer
-//             auto locked_producer = producer_ptr.Lock();
-//             locked_producer->RegisterTxnStart(op, &op->txn_localid);
-//         }
-//     }
-//     // HVLOG_F(1, "Handle local txn start: txn_id={:#x}", op->txn_localid);
-//     SharedLogMessage message =
-//         SharedLogMessageHelper::NewCCTxnStartMessage(op->txn_localid);
-//     message.logspace_id = op->logspace_id;
-//     message.user_logspace = op->user_logspace;
-//     uint16_t sequencer_id = bits::LowHalf32(op->logspace_id);
-//     bool success = SendSequencerMessage(sequencer_id, &message);
-//     if (!success) {
-//         HLOG(WARNING) << "Failed to send txn start message";
-//         FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-//     }
-// }
-
-void
-Engine::HandleLocalCCTxnStart(LocalOp* op)
-{
-    DCHECK(op->type == SharedLogOpType::CC_TXN_START);
-    if (!txn_engine_) {
-        HLOG(FATAL) << "Txn engine not activated";
-        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-        return;
-    }
-    // HVLOG_F(1, "Handle local txn start: txn_id={:#x}", op->txn_localid);
-    txn_engine_->RegisterTxnStart(op);
-    
-    SharedLogMessage message = SharedLogMessageHelper::NewCCTxnStartMessage(localid);
-    message.logspace_id = op->logspace_id;
-    message.user_logspace = op->user_logspace;
-    uint16_t sequencer_id = bits::LowHalf32(op->logspace_id);
-    bool success = SendSequencerMessage(sequencer_id, &message);
-    if (!success) {
-        HLOG(WARNING) << "Failed to send txn start message";
-        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-    }
-}
-
 void
 Engine::HandleLocalCCTxnCommit(LocalOp* op)
 {
     DCHECK(op->type == SharedLogOpType::CC_TXN_COMMIT);
     // HVLOG_F(1, "Handle local txn commit: txn_id={}", op->txn_id);
-
-    const View* view = nullptr;
-    // // storage use txn_localid as index
-    // // for commit, this is the same as txn_id, since we are only going to commit
-    // once cc_metadata.localid = op->txn_id;
-    // uint64_t txn_localid;
-    // uint32_t logspace_id;
-    {
-        absl::ReaderMutexLock view_lk(&view_mu_);
-        if (!current_view_active_) {
-            HLOG(WARNING) << "Current view not active";
-            FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-            return;
-        }
-        view = current_view_;
-        op->logspace_id = view->LogSpaceIdentifier(op->user_logspace);
-        const View::Engine* engine_node = view->GetEngineNode(my_node_id());
-        uint32_t expected_replicas =
-            static_cast<uint32_t>(engine_node->GetStorageNodes().size());
-        auto producer_ptr = producer_collection_.GetLogSpaceChecked(op->logspace_id);
-        {
-            auto locked_producer = producer_ptr.Lock();
-            locked_producer->RegisterCCOp(op, &op->txn_localid);
-            locked_producer->SetExpectedReplicas(op->txn_localid, expected_replicas);
-        }
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
     }
-    // TODO: for commit, set localid to txn_id
-    auto message = SharedLogMessageHelper::NewEmptySharedLogMessage();
-    log_utils::FillReplicateMsgWithOp(message, op);
-    ReplicateCCLogEntry(view, message, op->data.to_span());
-    // op->message.reset(message);
+    txn_engine_->RegisterTxnCommitOp(op);
+}
+
+void
+Engine::HandleLocalCCTxnWrite(LocalOp* op)
+{
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
+    }
+    uint64_t localid = txn_engine_->RegisterOp(op);
+    Message response =
+        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK);
+    FinishLocalOpWithResponse(op, &response, false);
+    HVLOG_F(1,
+            "Handle local txn write: localid={:#x} seqnum={:#x} key={:#x}",
+            localid,
+            op->seqnum,
+            op->query_tag);
+    auto message = NewCCTxnWriteMessage(op);
+    message.logspace_id = txn_engine_->logspace_id_;
+    bool success = ReplicateCCLogEntry(txn_engine_->view_,
+                                       message,
+                                       VECTOR_AS_SPAN(op->user_tags),
+                                       op->data.to_span());
+    if (!success) {
+        HLOG(FATAL) << "Failed to replicate txn write message";
+        return;
+        // FinishLocalOpWithFailure(op, SharedLogOpType::DISCARDED);
+    }
+    CCLogCachePut(op->seqnum, op->query_tag, op->data.to_span());
 }
 
 void
 Engine::HandleLocalAppend(LocalOp* op)
+{
+    if (use_txn_engine_) {
+        TxnEngineLocalAppend(op);
+    } else {
+        SLogLocalAppend(op);
+    }
+}
+
+void
+Engine::TxnEngineLocalAppend(LocalOp* op)
+{
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
+    }
+    // HVLOG_F(1, "Handle local txn start: txn_id={:#x}", op->txn_localid);
+    uint64_t localid = txn_engine_->RegisterOp(op);
+    auto message = NewCCReplicateMessage(op);
+    message.logspace_id = txn_engine_->logspace_id_;
+    bool success = ReplicateCCLogEntry(txn_engine_->view_,
+                                       message,
+                                       VECTOR_AS_SPAN(op->user_tags),
+                                       op->data.to_span());
+    if (!success) {
+        HLOG(FATAL) << "Failed to replicate txn start message";
+    }
+    CCLogCachePut(localid, op->data.to_span());
+}
+
+void
+Engine::SLogLocalAppend(LocalOp* op)
 {
     DCHECK(op->type == SharedLogOpType::APPEND);
     HVLOG_F(1,
@@ -364,15 +594,10 @@ Engine::HandleLocalAppend(LocalOp* op)
         view = current_view_;
         uint32_t logspace_id = view->LogSpaceIdentifier(op->user_logspace);
         log_metadata.seqnum = bits::JoinTwo32(logspace_id, 0);
-        // const View::Engine* engine_node = view->GetEngineNode(my_node_id());
-        // uint32_t expected_replicas =
-        //     static_cast<uint32_t>(engine_node->GetStorageNodes().size());
         auto producer_ptr = producer_collection_.GetLogSpaceChecked(logspace_id);
         {
             auto locked_producer = producer_ptr.Lock();
             locked_producer->LocalAppend(op, &log_metadata.localid);
-            // locked_producer->SetExpectedReplicas(log_metadata.localid,
-            //                                      expected_replicas);
         }
     }
     ReplicateLogEntry(view,
@@ -389,171 +614,42 @@ Engine::HandleLocalTrim(LocalOp* op)
 }
 
 void
-Engine::HandleCCLocalRead(LocalOp* op)
-{
-    HVLOG_F(1,
-            "Handle local read: call_id={} tag={} seqnum={}",
-            reinterpret_cast<const protocol::FuncCall*>(&op->func_call_id)->call_id,
-            op->query_tag,
-            op->seqnum);
-    // if (op->seqnum != kMaxLogSeqNum) {
-    //     // && sub_batch_idx!=invalid
-    //     // in the coming fix, should also check sub_batch_idx
-    //     // snapshot for ro txns goes to another handler
-    //     auto cached_aux_data = CCLogCacheGetAuxData(op->seqnum, op->query_tag);
-    //     if (cached_aux_data) {
-    //         Message response =
-    //             BuildLocalCCReadCachedResponse(op->seqnum,
-    //                                            STRING_AS_SPAN(*cached_aux_data));
-    //         FinishLocalOpWithResponse(op, &response, op->seqnum);
-    //         return;
-    //     }
-    // }
-    // onging_reads_.PutChecked(op->id, op);
-    const View::Sequencer* sequencer_node = nullptr;
-    LockablePtr<CCIndex> cc_index_ptr;
-    {
-        absl::ReaderMutexLock view_lk(&view_mu_);
-        ONHOLD_IF_SEEN_FUTURE_VIEW(op);
-        uint32_t logspace_id = current_view_->LogSpaceIdentifier(op->user_logspace);
-        op->logspace_id = logspace_id;
-        sequencer_node =
-            current_view_->GetSequencerNode(bits::LowHalf32(logspace_id));
-        if (sequencer_node->IsIndexEngineNode(my_node_id())) {
-            cc_index_ptr = cc_index_collection_.GetLogSpaceChecked(logspace_id);
-        }
-    }
-
-    // IndexQuery query = BuildIndexQuery(op);
-    // Index::QueryResultVec query_results;
-    CCIndex::IndexEntry idx_entry;
-    // TODO: use a vec here, when the queried global id(op.seqnum) is ahead of
-    // global_position_, hold it in pending queries
-    // this is only relevant for txns that run across engine nodes
-    {
-        auto locked_index = cc_index_ptr.ReaderLock();
-        idx_entry = locked_index->Lookup(op->query_tag, op->seqnum);
-        // locked_index->PollQueryResults(&query_results);
-    }
-    ProcessCCIndexLookupResult(op, idx_entry);
-}
-
-void
-Engine::ProcessCCIndexLookupResult(LocalOp* op, CCIndex::IndexEntry& idx_entry)
-{
-    HVLOG(1) << fmt::format(
-        "cc read call_id {} at tag {} seqnum {} returns at seqnum {} txn_id {:#x}",
-        reinterpret_cast<const protocol::FuncCall*>(&op->func_call_id)->call_id,
-        op->query_tag,
-        op->seqnum,
-        idx_entry.seqnum_,
-        idx_entry.txn_id);
-    if (idx_entry.txn_id == 0) {
-        // not found
-        FinishLocalOpWithFailure(op, SharedLogResultType::EMPTY);
-        return;
-    } else if (idx_entry.txn_id == protocol::kInvalidLogLocalId) {
-        // FinishLocalOpWithFailure(op, SharedLogResultType::EMPTY,
-        // idx_entry.seqnum_);
-        Message response =
-            BuildLocalCCReadOkResponse(idx_entry.seqnum_, EMPTY_CHAR_SPAN);
-        FinishLocalOpWithResponse(op, &response, idx_entry.seqnum_);
-        return;
-    }
-    if (auto cached_aux_data =
-            CCLogCacheGetAuxData(idx_entry.seqnum_, op->query_tag);
-        cached_aux_data.has_value())
-    {
-        HVLOG(1) << fmt::format("cc read op {} returns cached view at seqnum {}",
-                                op->id,
-                                idx_entry.seqnum_);
-        Message response =
-            BuildLocalCCReadCachedResponse(idx_entry.seqnum_,
-                                           STRING_AS_SPAN(cached_aux_data.value()));
-        FinishLocalOpWithResponse(op, &response, idx_entry.seqnum_);
-        return;
-    }
-    if (auto cached_log_entry = CCLogCacheGet(idx_entry.txn_id);
-        cached_log_entry.has_value())
-    {
-        // Cache hits
-        // HVLOG_F(1,
-        //         "CC Cache hits for log entry (txn_localid {:#x} batch_id {:#x})",
-        //         idx_entry.txn_id,
-        //         idx_entry.global_batch_position);
-        const CCLogEntry& cc_log_entry = cached_log_entry.value();
-        // LocalOp* op = onging_reads_.PollChecked(op->id);
-        Message response =
-            BuildLocalCCReadOkResponse(idx_entry.seqnum_,
-                                       STRING_AS_SPAN(cc_log_entry.data));
-
-        // std::optional<std::string> cached_aux_data =
-        //     CCLogCacheGetAuxData(idx_entry.txn_id);
-        // if (cached_aux_data.has_value()) {
-        //     size_t full_size = cc_log_entry.data.size() + cached_aux_data->size();
-        //     if (full_size <= MESSAGE_INLINE_DATA_SIZE) {
-        //         response.log_aux_data_size =
-        //             gsl::narrow_cast<uint16_t>(cached_aux_data->size());
-        //         MessageHelper::AppendInlineData(&response,
-        //                                         STRING_AS_SPAN(*cached_aux_data));
-        //     } else {
-        //         HLOG_F(WARNING,
-        //                "Inline buffer of message not large enough "
-        //                "for auxiliary data of log (txn_localid {} batch_id {:#x}):
-        //                " "log_size={}, aux_data_size={}",
-        //                bits::HexStr0x(idx_entry.txn_id),
-        //                idx_entry.global_batch_position,
-        //                cc_log_entry.data.size(),
-        //                cached_aux_data->size());
-        //     }
-        // }
-        FinishLocalOpWithResponse(op, &response, idx_entry.seqnum_);
-    } else {
-        // Cache miss
-        HVLOG_F(1, "CC Cache miss for op {} txn_id {:#x}", op->id, idx_entry.txn_id);
-        onging_reads_.PutChecked(op->id, op);
-        const View::Engine* engine_node = nullptr;
-        {
-            absl::ReaderMutexLock view_lk(&view_mu_);
-            // uint16_t view_id = query_result.found_result.view_id;
-            // if (view_id < views_.size()) {
-            //     const View* view = views_.at(view_id);
-            //     engine_node =
-            //         view->GetEngineNode(query_result.found_result.engine_id);
-            // } else {
-            //     HLOG_F(FATAL, "Cannot find view {}", view_id);
-            // }
-            uint16_t engine_id = bits::LowHalf32(bits::HighHalf64(idx_entry.txn_id));
-            engine_node = current_view_->GetEngineNode(engine_id);
-        }
-        bool success = SendStorageCCReadRequest(op, idx_entry, engine_node);
-        if (!success) {
-            HLOG_F(WARNING,
-                   "Failed to send read request for op {} txn_id {:#x}",
-                   op->id,
-                   idx_entry.txn_id);
-            onging_reads_.RemoveChecked(op->id);
-            FinishLocalOpWithFailure(op, SharedLogResultType::DATA_LOST);
-            // if (local_request) {
-            //     LocalOp* op = onging_reads_.PollChecked(query.client_data);
-            //     FinishLocalOpWithFailure(op, SharedLogResultType::DATA_LOST);
-            // } else {
-            //     SendReadFailureResponse(query, SharedLogResultType::DATA_LOST);
-            // }
-        }
-    }
-}
-
-void
 Engine::HandleLocalRead(LocalOp* op)
+{
+    if (use_txn_engine_) {
+        TxnEngineLocalRead(op);
+    } else {
+        SLogLocalRead(op);
+    }
+}
+
+void
+Engine::TxnEngineLocalRead(LocalOp* op)
+{
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
+    }
+    HVLOG_F(1,
+            "Handle local read: op_id={}, logspace={}, tag={}, seqnum={}",
+            op->id,
+            op->user_logspace,
+            op->query_tag,
+            bits::HexStr0x(op->seqnum));
+    auto index_info = txn_engine_->LookUp(op);
+    if (!index_info) {
+        // index query blocks on future index data
+        return;
+    }
+    ProcessIndexQueryResult(*index_info, op);
+}
+
+void
+Engine::SLogLocalRead(LocalOp* op)
 {
     DCHECK(op->type == SharedLogOpType::READ_NEXT ||
            op->type == SharedLogOpType::READ_PREV ||
            op->type == SharedLogOpType::READ_NEXT_B);
-    if (op->is_cc_op) {
-        HandleCCLocalRead(op);
-        return;
-    }
     HVLOG_F(1,
             "Handle local read: op_id={}, logspace={}, tag={}, seqnum={}",
             op->id,
@@ -609,52 +705,85 @@ Engine::HandleLocalRead(LocalOp* op)
 }
 
 void
-Engine::HandleLocalSetCCAuxData(LocalOp* op)
+Engine::ProcessIndexQueryResult(TxnEngine::IndexInfo& index_info, LocalOp* op)
 {
-    uint64_t seqnum = op->seqnum;
-    // LockablePtr<CCIndex> cc_index_ptr;
-    // {
-    //     absl::ReaderMutexLock view_lk(&view_mu_);
-    //     ONHOLD_IF_SEEN_FUTURE_VIEW(op);
-    //     uint32_t logspace_id =
-    //     current_view_->LogSpaceIdentifier(op->user_logspace); op->logspace_id =
-    //     logspace_id; auto sequencer_node =
-    //         current_view_->GetSequencerNode(bits::LowHalf32(logspace_id));
-    //     if (sequencer_node->IsIndexEngineNode(my_node_id())) {
-    //         cc_index_ptr = cc_index_collection_.GetLogSpaceChecked(logspace_id);
-    //     } else {
-    //         HLOG_F(FATAL,
-    //                "engine node {} does not index sequencer node {}",
-    //                my_node_id(),
-    //                sequencer_node->node_id());
-    //     }
-    // }
-    // {
-    //     auto locked_index = cc_index_ptr.Lock();
-    //     VLOG(1) << fmt::format("mark aux for key {} batch {:#x}",
-    //                            op->query_tag,
-    //                            global_batch_id);
-    //     locked_index->MarkSnapshot(op->query_tag, global_batch_id);
-    //     // locked_index->PollQueryResults(&query_results);
-    // }
+    if (op->seqnum == kInvalidLogSeqNum) {
+        FinishLocalOpWithFailure(op, SharedLogResultType::EMPTY);
+        return;
+    }
+    // TODO: process query_tag == kEmptyLogTag; currently not supported
+    if (index_info.is_txn && op->query_tag != index_info.cond_tag) {
+        ReadFromKVS(op);
+    } else {
+        op->localid =
+            bits::JoinTwo32(index_info.engine_id, index_info.localid_lowhalf);
+        ReadFromLog(op);
+    }
+}
 
-    CCLogCachePutAuxData(seqnum, op->query_tag, op->data.to_span());
-    Message response =
-        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::AUXDATA_OK,
-                                               seqnum);
-    FinishLocalOpWithResponse(op, &response, /* metalog_progress= */ 0);
-    // if (!absl::GetFlag(FLAGS_slog_engine_propagate_auxdata)) {
-    //     return;
-    // }
+void
+Engine::ReadFromKVS(LocalOp* op)
+{
+    auto txn_write = CCLogCacheGet(op->seqnum, op->query_tag);
+    if (txn_write) {
+        Message response =
+            MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK,
+                                                   op->seqnum);
+        MessageHelper::AppendInlineData(&response, STRING_AS_SPAN(*txn_write));
+        FinishLocalOpWithResponse(op, &response);
+        return;
+    }
+    // Cache miss
+    if (pending_kvs_reads_.Put(std::make_pair(op->seqnum, op->query_tag), op)) {
+        // read request already sent
+        return;
+    }
+    auto request = NewCCReadKVSMessage(op);
+    const View::Engine* engine_node =
+        txn_engine_->view_->GetEngineNode(my_node_id());
+    bool success = SendStorageCCReadRequest(request, engine_node);
+    if (!success) {
+        HLOG_F(FATAL,
+               "Failed to send kvs read request for seqnum {:#x} tag {}",
+               op->seqnum,
+               op->query_tag);
+        // FinishLocalOpWithFailure(op, SharedLogResultType::DATA_LOST);
+    }
+}
+
+void
+Engine::ReadFromLog(LocalOp* op)
+{
+    auto log_data = CCLogCacheGet(op->localid);
+    if (log_data) {
+        Message response =
+            MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK,
+                                                   op->seqnum);
+        MessageHelper::AppendInlineData(&response, STRING_AS_SPAN(*log_data));
+        FinishLocalOpWithResponse(op, &response);
+        return;
+    }
+    // Cache miss
+    if (pending_log_reads_.Put(op->localid, op)) {
+        // read request already sent
+        return;
+    }
+    auto request = NewCCReadLogMessage(op);
+    const View::Engine* engine_node =
+        txn_engine_->view_->GetEngineNode(my_node_id());
+    bool success = SendStorageCCReadRequest(request, engine_node);
+    if (!success) {
+        HLOG_F(FATAL,
+               "Failed to send log read request for seqnum {:#x} localid {:#x}",
+               op->seqnum,
+               op->localid);
+        // FinishLocalOpWithFailure(op, SharedLogResultType::DATA_LOST);
+    }
 }
 
 void
 Engine::HandleLocalSetAuxData(LocalOp* op)
 {
-    if (op->is_cc_op) {
-        HandleLocalSetCCAuxData(op);
-        return;
-    }
     uint64_t seqnum = op->seqnum;
     LogCachePutAuxData(seqnum, op->data.to_span());
     Message response =
@@ -725,12 +854,55 @@ Engine::HandleRemoteRead(const SharedLogMessage& request)
 }
 
 void
-Engine::OnRecvNewMetaLogs(const SharedLogMessage& message,
-                          std::span<const char> payload)
+Engine::OnRecvNewMetaLog(const SharedLogMessage& message,
+                         std::span<const char> payload)
 {
-    DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::METALOGS);
-    MetaLogsProto metalogs_proto = log_utils::MetaLogsFromPayload(payload);
-    DCHECK_EQ(metalogs_proto.logspace_id(), message.logspace_id);
+    if (use_txn_engine_) {
+        TxnEngineRecvMetaLog(message, payload);
+    } else {
+        SLogRecvMetaLog(message, payload);
+    }
+}
+
+void
+Engine::TxnEngineRecvMetaLog(const protocol::SharedLogMessage& message,
+                             std::span<const char> payload)
+{
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
+    }
+    std::optional<std::vector<MetaLogProto*>> metalogs;
+    {
+        absl::MutexLock lk(&txn_engine_->metalog_buffer_.buffer_mu_);
+        txn_engine_->metalog_buffer_.ProvideRaw(payload);
+        metalogs = txn_engine_->metalog_buffer_.PollBuffer();
+    }
+    if (!metalogs) {
+        return;
+    }
+    // auto* metalog = txn_engine_->metalog_pool_.Get();
+    // metalog.ParseFromArray(payload.data(), static_cast<int>(payload.size()));
+    TxnEngine::FinishedOpVec finished_ops;
+    {
+        absl::MutexLock lk(&txn_engine_->append_mu_);
+        txn_engine_->ApplyMetaLogs(*metalogs);
+        txn_engine_->PollFinishedOps(finished_ops);
+    }
+    for (LocalOp* op: finished_ops) {
+        ProcessFinishedOp(op);
+    }
+    // txn_engine_->metalog_pool_.Return(metalog);
+    txn_engine_->metalog_buffer_.Recycle(*metalogs);
+}
+
+void
+Engine::SLogRecvMetaLog(const protocol::SharedLogMessage& message,
+                        std::span<const char> payload)
+{
+    DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::METALOG);
+    MetaLogProto metalog_proto = log_utils::MetaLogFromPayload(payload);
+    DCHECK_EQ(metalog_proto.logspace_id(), message.logspace_id);
     LogProducer::AppendResultVec append_results;
     Index::QueryResultVec query_results;
     {
@@ -741,9 +913,8 @@ Engine::OnRecvNewMetaLogs(const SharedLogMessage& message,
             producer_collection_.GetLogSpaceChecked(message.logspace_id);
         {
             auto locked_producer = producer_ptr.Lock();
-            for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs()) {
-                locked_producer->ProvideMetaLog(metalog_proto);
-            }
+            // for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs())
+            locked_producer->ProvideMetaLog(metalog_proto);
             locked_producer->PollAppendResults(&append_results);
         }
         if (current_view_->GetEngineNode(my_node_id())
@@ -753,9 +924,8 @@ Engine::OnRecvNewMetaLogs(const SharedLogMessage& message,
                 index_collection_.GetLogSpaceChecked(message.logspace_id);
             {
                 auto locked_index = index_ptr.Lock();
-                for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs()) {
-                    locked_index->ProvideMetaLog(metalog_proto);
-                }
+                // for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs())
+                locked_index->ProvideMetaLog(metalog_proto);
                 locked_index->PollQueryResults(&query_results);
             }
         }
@@ -765,10 +935,93 @@ Engine::OnRecvNewMetaLogs(const SharedLogMessage& message,
 }
 
 void
+Engine::ProcessFinishedOp(LocalOp* op)
+{
+    // if cond op failed, then seqnum is kInvalidLogSeqNum
+    if (op->is_cond_op && op->seqnum == kInvalidLogSeqNum) {
+        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
+        return;
+    }
+    if (op->type == SharedLogOpType::CC_TXN_WRITE) {
+        RecycleLocalOp(op);
+        return;
+    }
+    Message response =
+        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK,
+                                               op->seqnum);
+    HVLOG(1) << fmt::format("op type={:#x} localid={:#x} seqnum={:#x} finished",
+                            static_cast<uint16_t>(op->type),
+                            op->localid,
+                            op->seqnum);
+    FinishLocalOpWithResponse(op, &response);
+}
+
+void
 Engine::OnRecvNewIndexData(const SharedLogMessage& message,
                            std::span<const char> payload)
 {
-    HVLOG(1) << "recv index";
+    if (use_txn_engine_) {
+        TxnEngineRecvNewIndexData(message, payload);
+    } else {
+        SLogRecvNewIndexData(message, payload);
+    }
+}
+
+void
+Engine::TxnEngineRecvNewIndexData(const protocol::SharedLogMessage& message,
+                                  std::span<const char> payload)
+{
+    if (!txn_engine_) {
+        HLOG(FATAL) << "Txn engine not activated";
+        return;
+    }
+    auto storage_index = std::make_unique<PerStorageIndexProto>();
+    storage_index->ParseFromArray(payload.data(), static_cast<int>(payload.size()));
+    std::optional<std::vector<PerEngineIndexProto*>> engine_indices;
+    {
+        absl::MutexLock lk(&txn_engine_->index_buffer_.buffer_mu_);
+        for (auto& engine_index: *storage_index->mutable_engine_indices()) {
+            txn_engine_->index_buffer_.ProvideAllocated(&engine_index);
+        }
+        engine_indices = txn_engine_->index_buffer_.PollBuffer();
+    }
+    if (!engine_indices) {
+        return;
+    }
+    // apply and poll cond ops and pending reads
+    // NOTE: for append ops, applying index only finishes cond ops, while applying
+    // metalog finishes none-cond ops though it is possible that index is ahead of
+    // metalog, and non-cond ops can be finished here, we leave that completely to
+    // metalog for clarity
+    TxnEngine::CondOpResultVec cond_op_results;
+    TxnEngine::IndexQueryResultVec pending_query_results;
+    {
+        absl::MutexLock lk(&txn_engine_->index_mu_);
+        txn_engine_->ApplyIndices(*engine_indices);
+        txn_engine_->PollCondOpResults(cond_op_results);
+        txn_engine_->PollIndexQueryResults(pending_query_results);
+    }
+    txn_engine_->index_buffer_.Recycle(*engine_indices);
+    // finish cond ops
+    TxnEngine::FinishedOpVec finished_cond_ops;
+    {
+        absl::MutexLock lk(&txn_engine_->append_mu_);
+        txn_engine_->FinishCondOps(cond_op_results);
+        txn_engine_->PollFinishedOps(finished_cond_ops);
+    }
+    for (LocalOp* op: finished_cond_ops) {
+        ProcessFinishedOp(op);
+    }
+    // process pending reads
+    for (auto& [index_info, op]: pending_query_results) {
+        ProcessIndexQueryResult(index_info, op);
+    }
+}
+
+void
+Engine::SLogRecvNewIndexData(const protocol::SharedLogMessage& message,
+                             std::span<const char> payload)
+{
     DCHECK(SharedLogMessageHelper::GetOpType(message) ==
            SharedLogOpType::INDEX_DATA);
     IndexDataProto index_data_proto;
@@ -802,63 +1055,97 @@ Engine::OnRecvNewIndexData(const SharedLogMessage& message,
     ProcessIndexQueryResults(query_results);
 }
 
-void
-Engine::OnRecvCCGlobalBatch(const SharedLogMessage& message,
-                            std::span<const char> payload)
-{
-    DCHECK(SharedLogMessageHelper::GetOpType(message) ==
-           SharedLogOpType::CC_GLOBAL_BATCH);
-    CCGlobalBatchProto global_batch;
-    if (!global_batch.ParseFromArray(payload.data(),
-                                     static_cast<int>(payload.size())))
-    {
-        LOG(FATAL) << "Failed to parse CCGlobalBatchProto";
-    }
-    HVLOG(1) << fmt::format("recv global batch {}", global_batch.global_batch_id());
-    LogProducer::TxnStartResultVec txn_start_results;
-    LogProducer::TxnCommitBatchResult txn_commit_batch_result;
-    uint64_t finished_snapshot;
-    {
-        absl::ReaderMutexLock view_lk(&view_mu_);
-        // ONHOLD_IF_FROM_FUTURE_VIEW(message, payload);
-        auto producer_ptr =
-            producer_collection_.GetLogSpaceChecked(message.logspace_id);
-        {
-            auto locked_producer = producer_ptr.Lock();
-            finished_snapshot = locked_producer->ProvideCCGlobalBatch(global_batch);
-            // HVLOG(1) << "advance snapshot to " << finished_snapshot;
-            // finished_snapshot_.store(finished_snapshot,
-            // std::memory_order_relaxed);
-            locked_producer->PollTxnStartResults(&txn_start_results);
-            locked_producer->PollTxnCommitBatchResults(&txn_commit_batch_result);
-        }
-        if (current_view_->GetEngineNode(my_node_id())
-                ->HasIndexFor(message.sequencer_id))
-        {
-            auto cc_index_ptr =
-                cc_index_collection_.GetLogSpaceChecked(message.logspace_id);
-            {
-                auto locked_cc_index = cc_index_ptr.Lock();
-                // for (const MetaLogProto& metalog_proto: metalogs_proto.metalogs())
-                // {
-                //     locked_index->ProvideMetaLog(metalog_proto);
-                // }
-                // locked_index->PollQueryResults(&query_results);
-                locked_cc_index->ProvideCCGlobalBatch(global_batch,
-                                                      finished_snapshot);
-            }
-        }
-    }
-    ProcessTxnStartResult(txn_start_results);
-    ProcessTxnCommitResult(txn_commit_batch_result);
-}
-
 #undef ONHOLD_IF_FROM_FUTURE_VIEW
 #undef IGNORE_IF_FROM_PAST_VIEW
 
 void
 Engine::OnRecvResponse(const SharedLogMessage& message,
                        std::span<const char> payload)
+{
+    if (use_txn_engine_) {
+        TxnEngineRecvResponse(message, payload);
+    } else {
+        SLogRecvResponse(message, payload);
+    }
+}
+
+void
+Engine::TxnEngineRecvResponse(const SharedLogMessage& message,
+                              std::span<const char> payload)
+{
+    // only read responses here
+    switch (SharedLogMessageHelper::GetOpType(message)) {
+    case SharedLogOpType::CC_READ_KVS:
+        ProcessKVSReadResult(message, payload);
+        break;
+    case SharedLogOpType::CC_READ_LOG:
+        ProcessLogReadResult(message, payload);
+        break;
+    default:
+        HLOG(FATAL) << "Unknown response op type: " << message.op_type;
+    }
+}
+
+void
+Engine::ProcessKVSReadResult(const protocol::SharedLogMessage& message,
+                             std::span<const char> payload)
+{
+    auto result = SharedLogMessageHelper::GetResultType(message);
+    if (result == SharedLogResultType::DATA_LOST) {
+        HLOG(FATAL) << fmt::format("kvs read seqnum={:#x} tag={} data lost",
+                                   message.query_seqnum,
+                                   message.query_tag);
+        return;
+    }
+    if (result != SharedLogResultType::READ_OK) {
+        HLOG(FATAL) << "Unknown result op type: " << message.op_result;
+        return;
+    }
+    Message response =
+        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK,
+                                               message.query_seqnum);
+    MessageHelper::AppendInlineData(&response, payload);
+    std::vector<LocalOp*> finished_ops;
+    pending_kvs_reads_.Poll(std::make_pair(message.query_seqnum, message.query_tag),
+                            finished_ops);
+    for (LocalOp* op: finished_ops) {
+        FinishLocalOpWithResponse(op, &response);
+    }
+    CCLogCachePut(message.query_seqnum, message.query_tag, payload);
+}
+
+void
+Engine::ProcessLogReadResult(const protocol::SharedLogMessage& message,
+                             std::span<const char> payload)
+{
+    auto result = SharedLogMessageHelper::GetResultType(message);
+    uint64_t query_seqnum =
+        bits::JoinTwo32(message.logspace_id, message.seqnum_lowhalf);
+    if (result == SharedLogResultType::DATA_LOST) {
+        HLOG(FATAL) << fmt::format("log read seqnum={:#x} localid={:#x} data lost",
+                                   query_seqnum,
+                                   message.localid);
+        return;
+    }
+    if (result != SharedLogResultType::READ_OK) {
+        HLOG(FATAL) << "Unknown result op type: " << message.op_result;
+        return;
+    }
+    Message response =
+        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::READ_OK,
+                                               query_seqnum);
+    MessageHelper::AppendInlineData(&response, payload);
+    std::vector<LocalOp*> finished_ops;
+    pending_log_reads_.Poll(message.localid, finished_ops);
+    for (LocalOp* op: finished_ops) {
+        FinishLocalOpWithResponse(op, &response);
+    }
+    CCLogCachePut(message.localid, payload);
+}
+
+void
+Engine::SLogRecvResponse(const SharedLogMessage& message,
+                         std::span<const char> payload)
 {
     DCHECK(SharedLogMessageHelper::GetOpType(message) == SharedLogOpType::RESPONSE);
     SharedLogResultType result = SharedLogMessageHelper::GetResultType(message);
@@ -873,10 +1160,6 @@ Engine::OnRecvResponse(const SharedLogMessage& message,
             return;
         }
         if (result == SharedLogResultType::READ_OK) {
-            if (op->is_cc_op) {
-                OnRecvCCReadResponse(op, message, payload);
-                return;
-            }
             uint64_t seqnum =
                 bits::JoinTwo32(message.logspace_id, message.seqnum_lowhalf);
             HVLOG_F(1,
@@ -916,135 +1199,8 @@ Engine::OnRecvResponse(const SharedLogMessage& message,
         } else {
             UNREACHABLE();
         }
-    } else if (result == SharedLogResultType::REPLICATE_OK) {
-        OnCCOpReplicated(message, payload);
     } else {
         HLOG(FATAL) << "Unknown result type: " << message.op_result;
-    }
-}
-
-void
-Engine::OnRecvCCReadResponse(LocalOp* op,
-                             const protocol::SharedLogMessage& message,
-                             std::span<const char> payload)
-{
-    // HVLOG_F(1,
-    //         "Receive remote read response for op {} txn_id {:#x}",
-    //         op->id,
-    //         message.txn_id);
-    // NOTE: message.user_metalog_progress holds the queried seqnum
-    if (payload.size() == 0) {
-        HLOG(FATAL) << fmt::format(
-            "Empty payload from storage {} for op {} txn_id {:#x}",
-            message.origin_node_id,
-            op->id,
-            message.txn_id);
-    }
-    Message response =
-        BuildLocalCCReadOkResponse(message.user_metalog_progress, payload);
-    // if (aux_data.size() > 0) {
-    //     response.log_aux_data_size = gsl::narrow_cast<uint16_t>(aux_data.size());
-    //     MessageHelper::AppendInlineData(&response, aux_data);
-    // }
-    FinishLocalOpWithResponse(op, &response, message.user_metalog_progress);
-    CCLogEntry cc_entry;
-    // TODO: fix this, directly caching payload would be fine
-    // NOTE: common header is of no use, message.txn_localid(union with client_data)
-    // actually holds op_id, but we are not using it anyway
-    log_utils::FillCCLogEntryWithReplicateMsg(&cc_entry, &message, payload);
-    cc_entry.common_header.txn_localid = message.txn_id;
-    CCLogCachePut(&cc_entry);
-    // put aux data to cache?
-}
-
-void
-Engine::OnCCOpReplicated(const protocol::SharedLogMessage& message,
-                         std::span<const char> payload)
-{
-    LocalOp* op = nullptr;
-    {
-        absl::ReaderMutexLock view_lk(&view_mu_);
-        auto producer_ptr =
-            producer_collection_.GetLogSpaceChecked(message.logspace_id);
-        auto locked_producer = producer_ptr.Lock();
-        // for txn commit, localid is the same as txn_id
-        void* op_ptr = locked_producer->OnRecvReplicateOK(message.txn_localid);
-        if (op_ptr != nullptr) {
-            op = reinterpret_cast<LocalOp*>(op_ptr);
-        } else {
-            // HLOG_F(WARNING, "Cannot find append op with id {}",
-            // message.txn_localid);
-            return;
-        }
-    }
-    HVLOG(1) << fmt::format("txn localid {:#x} op {:#x} replicated",
-                            op->txn_localid,
-                            static_cast<uint16_t>(op->type));
-    // auto msg = op->message.get();
-    // log_utils::ReorderMsgFromReplicateMsg(msg, op);
-
-    // uint16_t sequencer_id = bits::LowHalf32(message.logspace_id);
-    // bool success =
-    //     SendSequencerMessage(sequencer_id,
-    //                          msg,
-    //                          op->data.to_span().subspan(0, msg->payload_size));
-    // if (!success) {
-    //     HLOG_F(ERROR,
-    //            "Failed to send reorder message to sequencer {}",
-    //            sequencer_id);
-    //     FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-    //     return;
-    // }
-    // // CCLogEntry cc_entry;
-    // // log_utils::FillCCLogEntryWithOp(&cc_entry, op);
-    // // CCLogCachePut(&cc_entry);
-}
-
-void
-Engine::ProcessTxnStartResult(
-    const LogProducer::TxnStartResultVec& txn_start_results)
-{
-    for (auto& result: txn_start_results) {
-        LocalOp* op = reinterpret_cast<LocalOp*>(result.caller_data);
-        Message response =
-            MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK,
-                                                   result.snapshot_seqnum);
-        response.txn_id = op->txn_localid;
-        HVLOG(1) << fmt::format("txn {:#x} started seqnum={}",
-                                op->txn_localid,
-                                result.snapshot_seqnum);
-        FinishLocalOpWithResponse(op, &response, result.snapshot_seqnum);
-    }
-}
-
-void
-Engine::ProcessTxnCommitResult(
-    const LogProducer::TxnCommitBatchResult& txn_commit_results)
-{
-    // auto& actual_results = global_batch.results();
-    // CHECK(static_cast<size_t>(actual_results.size()) ==
-    // txn_commit_results.size());
-    HVLOG(1) << fmt::format("processing {} commit results",
-                            txn_commit_results.size());
-    for (auto& result: txn_commit_results) {
-        // auto& actual_result = actual_results[static_cast<int>(i)];
-        LocalOp* op = reinterpret_cast<LocalOp*>(result.caller_data);
-        if (result.seqnum == kInvalidLogSeqNum) {
-            FinishLocalOpWithFailure(op, SharedLogResultType::ABORTED);
-            HVLOG(1) << fmt::format("txn {:#x} aborted", op->txn_localid);
-            continue;
-        }
-
-        Message response =
-            MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK,
-                                                   result.seqnum);
-        HVLOG(1) << fmt::format("txn {:#x} committed at seqnum {}",
-                                op->txn_localid,
-                                result.seqnum);
-        CCLogEntry cc_entry;
-        log_utils::FillCCLogEntryWithOp(&cc_entry, op);
-        CCLogCachePut(&cc_entry);
-        FinishLocalOpWithResponse(op, &response, result.seqnum);
     }
 }
 
@@ -1331,5 +1487,4 @@ Engine::BuildIndexQuery(const IndexQueryResult& result)
     query.prev_found_result = result.found_result;
     return query;
 }
-
 }} // namespace faas::log

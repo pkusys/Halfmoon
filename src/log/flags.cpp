@@ -23,7 +23,8 @@ ABSL_FLAG(std::string,
 ABSL_FLAG(int, slog_storage_bgthread_interval_ms, 1, "");
 ABSL_FLAG(size_t, slog_storage_max_live_entries, 65536, "");
 
-ABSL_FLAG(size_t, cc_reorder_batch_size, 64, "Batch size for CC reorder");
-ABSL_FLAG(size_t, cc_reorder_quickselect, 1, "k of Quickselect in removing cycles");
-ABSL_FLAG(int64_t, cc_reorder_max_interval_us, 1500, "max interval for batching");
-ABSL_FLAG(int, cc_reorder_max_interval_rel, 5, "max interval for batching");
+// ABSL_FLAG(size_t, cc_reorder_batch_size, 64, "Batch size for CC reorder");
+// ABSL_FLAG(size_t, cc_reorder_quickselect, 1, "k of Quickselect in removing cycles");
+// ABSL_FLAG(int64_t, cc_reorder_max_interval_us, 1500, "max interval for batching");
+// ABSL_FLAG(int, cc_reorder_max_interval_rel, 5, "max interval for batching");
+ABSL_FLAG(bool, use_txn_engine, false, "");

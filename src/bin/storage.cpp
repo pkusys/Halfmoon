@@ -8,7 +8,7 @@ ABSL_FLAG(int,
           -1,
           "My node ID. Also settable through environment variable FAAS_NODE_ID.");
 ABSL_FLAG(std::string, db_path, "", "Path for RocksDB database storage.");
-ABSL_FLAG(std::string, cc_db_path, "", "Path for RocksDB database storage.");
+// ABSL_FLAG(std::string, cc_db_path, "", "Path for RocksDB database storage.");
 
 namespace faas {
 
@@ -38,7 +38,7 @@ StorageMain(int argc, char* argv[])
     auto storage = std::make_unique<log::Storage>(node_id);
 
     storage->set_db_path(absl::GetFlag(FLAGS_db_path));
-    storage->set_cc_db_path(absl::GetFlag(FLAGS_cc_db_path));
+    // storage->set_cc_db_path(absl::GetFlag(FLAGS_cc_db_path));
 
     storage->Start();
     server_ptr.store(storage.get());

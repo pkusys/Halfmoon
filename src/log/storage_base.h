@@ -6,9 +6,11 @@
 #include "log/view_watcher.h"
 #include "log/db.h"
 #include "log/cache.h"
+#include "proto/shared_log.pb.h"
 #include "server/server_base.h"
 #include "server/ingress_connection.h"
 #include "server/egress_hub.h"
+#include <string>
 
 namespace faas { namespace log {
 
@@ -19,11 +21,10 @@ public:
 
     void set_db_path(std::string_view path) { db_path_ = std::string(path); }
 
-    std::string cc_db_path_;
-    std::unique_ptr<DBInterface> cc_db_;
-    void set_cc_db_path(std::string_view path) { cc_db_path_ = std::string(path); }
-    void PutCCLogEntryToDB(CCLogEntry& cc_entry);
-    std::optional<CCLogEntry> GetCCLogEntryFromDB(uint64_t txn_id);
+    bool use_txn_engine_;
+    // std::string cc_db_path_;
+    // std::unique_ptr<DBInterface> cc_db_;
+    // void set_cc_db_path(std::string_view path){ cc_db_path_ = std::string(path); }
 
 protected:
     uint16_t my_node_id() const { return node_id_; }
@@ -31,26 +32,47 @@ protected:
     virtual void OnViewCreated(const View* view) = 0;
     virtual void OnViewFinalized(const FinalizedView* finalized_view) = 0;
 
-    virtual void HandleReadAtRequest(const protocol::SharedLogMessage& request) = 0;
-    virtual void HandleReplicateRequest(const protocol::SharedLogMessage& message,
-                                        std::span<const char> payload) = 0;
-    virtual void OnRecvNewMetaLogs(const protocol::SharedLogMessage& message,
-                                   std::span<const char> payload) = 0;
-    virtual void OnRecvLogAuxData(const protocol::SharedLogMessage& message,
-                                  std::span<const char> payload) = 0;
-
     virtual void BackgroundThreadMain() = 0;
     virtual void SendShardProgressIfNeeded() = 0;
+
+    void MessageHandler(const protocol::SharedLogMessage& message,
+                        std::span<const char> payload);
+    virtual void HandleReadAtRequest(const protocol::SharedLogMessage& request) = 0;
+    virtual void HandleCCReadLogRequest(
+        const protocol::SharedLogMessage& request) = 0;
+    virtual void HandleCCReadKVSRequest(
+        const protocol::SharedLogMessage& request) = 0;
+
+    virtual void HandleReplicateRequest(const protocol::SharedLogMessage& message,
+                                        std::span<const char> payload) = 0;
+    virtual void HandleCCTxnWriteRequest(const protocol::SharedLogMessage& message,
+                                         std::span<const char> payload) = 0;
+
+    virtual void OnRecvNewMetaLog(const protocol::SharedLogMessage& message,
+                                  std::span<const char> payload) = 0;
+    virtual void OnRecvLogAuxData(const protocol::SharedLogMessage& message,
+                                  std::span<const char> payload) = 0;
 
     void LogCachePutAuxData(uint64_t seqnum, std::span<const char> data);
     std::optional<std::string> LogCacheGetAuxData(uint64_t seqnum);
 
-    void MessageHandler(const protocol::SharedLogMessage& message,
-                        std::span<const char> payload);
     std::optional<LogEntryProto> GetLogEntryFromDB(uint64_t seqnum);
     void PutLogEntryToDB(const LogEntry& log_entry);
 
-    void SendIndexData(const View* view, const IndexDataProto& index_data_proto);
+    std::optional<CCLogEntry> GetCCLogEntryFromDB(uint32_t logspace_id,
+                                                  uint64_t localid);
+    void PutCCLogEntryToDB(uint32_t logspace_id,
+                           uint64_t localid,
+                           const CCLogEntry& log_entry);
+
+    std::optional<std::string> GetKVFromDB(uint64_t seqnum, uint64_t key);
+    void PutKVToDB(uint64_t seqnum, uint64_t key, const std::string& value);
+
+    void SLogSendIndexData(const View* view, const IndexDataProto& index_data_proto);
+    void CCSendIndexData(const View* view,
+                         uint32_t logspace_id,
+                         const PerStorageIndexProto& index_data_proto);
+
     bool SendSequencerMessage(uint16_t sequencer_id,
                               protocol::SharedLogMessage* message,
                               std::span<const char> payload);
