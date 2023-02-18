@@ -598,67 +598,37 @@ func (w *FuncWorker) SharedLogAppend(ctx context.Context, tags []uint64, data []
 	}
 }
 
-func (w *FuncWorker) SLogCCTxnStart(ctx context.Context) ( /* txn_id, seqnum */ uint64, uint64, error) {
-	sleepDuration := 5 * time.Millisecond
-	remainingRetries := 4
-
-	for {
-		id := atomic.AddUint64(&w.nextLogOpId, 1)
-		currentCallId := atomic.LoadUint64(&w.currentCall)
-		message := protocol.NewSLogCCTxnStartMessage(currentCallId, w.clientId, id)
-
-		w.mux.Lock()
-		outputChan := make(chan []byte, 1)
-		w.outgoingLogOps[id] = outputChan
-		_, err := w.outputPipe.Write(message)
-		w.mux.Unlock()
-		if err != nil {
-			return 0, 0, err
-		}
-
-		response := <-outputChan
-		result := protocol.GetSharedLogResultTypeFromMessage(response)
-		if result == protocol.SharedLogResultType_APPEND_OK {
-			return protocol.GetTxnIdFromMessage(response), protocol.GetLogSeqNumFromMessage(response), nil
-		} else if result == protocol.SharedLogResultType_DISCARDED {
-			log.Printf("[ERROR] Txn Start discarded, will retry")
-			if remainingRetries > 0 {
-				time.Sleep(sleepDuration)
-				sleepDuration *= 2
-				remainingRetries--
-				continue
-			} else {
-				return 0, 0, fmt.Errorf("Failed to append txn start")
-			}
-		} else {
-			return 0, 0, fmt.Errorf("Failed to append txn start")
-		}
-	}
-}
-
-func (w *FuncWorker) SLogCCTxnCommit(ctx context.Context, txnId uint64, seqNum uint64, data []byte) (uint64, error) {
-	// should serialize
+// Implement types.Environment
+func (w *FuncWorker) SharedLogConditionalAppend(ctx context.Context, tags []uint64, data []byte, condTag uint64, condPos uint32) (uint64, error) {
 	if len(data) == 0 {
 		return 0, fmt.Errorf("Data cannot be empty")
 	}
-	if len(data) > protocol.MessageInlineDataSize {
-		return 0, fmt.Errorf("Data too larger (size=%d), expect no more than %d bytes", len(data), protocol.MessageInlineDataSize)
+	tags, err := checkAndDuplicateTags(tags)
+	if err != nil {
+		return 0, err
+	}
+	if len(data)+len(tags)*protocol.SharedLogTagByteSize > protocol.MessageInlineDataSize {
+		return 0, fmt.Errorf("Data too larger (size=%d, num_tags=%d), expect no more than %d bytes", len(data), len(tags), protocol.MessageInlineDataSize)
 	}
 
-	sleepDuration := 5 * time.Millisecond
-	remainingRetries := 4
+	// sleepDuration := 5 * time.Millisecond
+	// remainingRetries := 4
 
 	for {
 		id := atomic.AddUint64(&w.nextLogOpId, 1)
 		currentCallId := atomic.LoadUint64(&w.currentCall)
-		message := protocol.NewSLogCCTxnCommitMessage(currentCallId, w.clientId, txnId, seqNum, id)
-		// data needs to be set with hdr+payload
-		protocol.FillInlineDataInMessage(message, data)
+		message := protocol.NewSharedLogConditionalAppendMessage(currentCallId, w.clientId, uint16(len(tags)), id, condTag, condPos)
+		if len(tags) == 0 {
+			protocol.FillInlineDataInMessage(message, data)
+		} else {
+			tagBuffer := protocol.BuildLogTagsBuffer(tags)
+			protocol.FillInlineDataInMessage(message, bytes.Join([][]byte{tagBuffer, data}, nil /* sep */))
+		}
 
 		w.mux.Lock()
 		outputChan := make(chan []byte, 1)
 		w.outgoingLogOps[id] = outputChan
-		_, err := w.outputPipe.Write(message)
+		_, err = w.outputPipe.Write(message)
 		w.mux.Unlock()
 		if err != nil {
 			return 0, err
@@ -669,20 +639,107 @@ func (w *FuncWorker) SLogCCTxnCommit(ctx context.Context, txnId uint64, seqNum u
 		if result == protocol.SharedLogResultType_APPEND_OK {
 			return protocol.GetLogSeqNumFromMessage(response), nil
 		} else if result == protocol.SharedLogResultType_DISCARDED {
-			log.Printf("[ERROR] Append discarded, will retry")
-			if remainingRetries > 0 {
-				time.Sleep(sleepDuration)
-				sleepDuration *= 2
-				remainingRetries--
-				continue
-			} else {
-				return 0, fmt.Errorf("Failed to append log")
-			}
-		} else if result == protocol.SharedLogCCResultType_ABORTED {
-			return protocol.MaxLogSeqnum, nil
+			return 0, fmt.Errorf("Condition failed")
+			// log.Printf("[ERROR] Append discarded, will retry")
+			// if remainingRetries > 0 {
+			// 	time.Sleep(sleepDuration)
+			// 	sleepDuration *= 2
+			// 	remainingRetries--
+			// 	continue
+			// } else {
+			// 	return 0, fmt.Errorf("Failed to append log")
+			// }
+		} else {
+			return 0, fmt.Errorf("Failed to append log")
 		}
 	}
 }
+
+// func (w *FuncWorker) SLogCCTxnStart(ctx context.Context) ( /* txn_id, seqnum */ uint64, uint64, error) {
+// 	sleepDuration := 5 * time.Millisecond
+// 	remainingRetries := 4
+
+// 	for {
+// 		id := atomic.AddUint64(&w.nextLogOpId, 1)
+// 		currentCallId := atomic.LoadUint64(&w.currentCall)
+// 		message := protocol.NewSLogCCTxnStartMessage(currentCallId, w.clientId, id)
+
+// 		w.mux.Lock()
+// 		outputChan := make(chan []byte, 1)
+// 		w.outgoingLogOps[id] = outputChan
+// 		_, err := w.outputPipe.Write(message)
+// 		w.mux.Unlock()
+// 		if err != nil {
+// 			return 0, 0, err
+// 		}
+
+// 		response := <-outputChan
+// 		result := protocol.GetSharedLogResultTypeFromMessage(response)
+// 		if result == protocol.SharedLogResultType_APPEND_OK {
+// 			return protocol.GetTxnIdFromMessage(response), protocol.GetLogSeqNumFromMessage(response), nil
+// 		} else if result == protocol.SharedLogResultType_DISCARDED {
+// 			log.Printf("[ERROR] Txn Start discarded, will retry")
+// 			if remainingRetries > 0 {
+// 				time.Sleep(sleepDuration)
+// 				sleepDuration *= 2
+// 				remainingRetries--
+// 				continue
+// 			} else {
+// 				return 0, 0, fmt.Errorf("Failed to append txn start")
+// 			}
+// 		} else {
+// 			return 0, 0, fmt.Errorf("Failed to append txn start")
+// 		}
+// 	}
+// }
+
+// func (w *FuncWorker) SLogCCTxnCommit(ctx context.Context, txnId uint64, seqNum uint64, data []byte) (uint64, error) {
+// 	// should serialize
+// 	if len(data) == 0 {
+// 		return 0, fmt.Errorf("Data cannot be empty")
+// 	}
+// 	if len(data) > protocol.MessageInlineDataSize {
+// 		return 0, fmt.Errorf("Data too larger (size=%d), expect no more than %d bytes", len(data), protocol.MessageInlineDataSize)
+// 	}
+
+// 	sleepDuration := 5 * time.Millisecond
+// 	remainingRetries := 4
+
+// 	for {
+// 		id := atomic.AddUint64(&w.nextLogOpId, 1)
+// 		currentCallId := atomic.LoadUint64(&w.currentCall)
+// 		message := protocol.NewSLogCCTxnCommitMessage(currentCallId, w.clientId, txnId, seqNum, id)
+// 		// data needs to be set with hdr+payload
+// 		protocol.FillInlineDataInMessage(message, data)
+
+// 		w.mux.Lock()
+// 		outputChan := make(chan []byte, 1)
+// 		w.outgoingLogOps[id] = outputChan
+// 		_, err := w.outputPipe.Write(message)
+// 		w.mux.Unlock()
+// 		if err != nil {
+// 			return 0, err
+// 		}
+
+// 		response := <-outputChan
+// 		result := protocol.GetSharedLogResultTypeFromMessage(response)
+// 		if result == protocol.SharedLogResultType_APPEND_OK {
+// 			return protocol.GetLogSeqNumFromMessage(response), nil
+// 		} else if result == protocol.SharedLogResultType_DISCARDED {
+// 			log.Printf("[ERROR] Append discarded, will retry")
+// 			if remainingRetries > 0 {
+// 				time.Sleep(sleepDuration)
+// 				sleepDuration *= 2
+// 				remainingRetries--
+// 				continue
+// 			} else {
+// 				return 0, fmt.Errorf("Failed to append log")
+// 			}
+// 		} else if result == protocol.SharedLogCCResultType_ABORTED {
+// 			return protocol.MaxLogSeqnum, nil
+// 		}
+// 	}
+// }
 
 func buildLogEntryFromReadResponse(response []byte) *types.LogEntry {
 	seqNum := protocol.GetLogSeqNumFromMessage(response)
@@ -691,8 +748,8 @@ func buildLogEntryFromReadResponse(response []byte) *types.LogEntry {
 	responseData := protocol.GetInlineDataFromMessage(response)
 	logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
 	if logDataSize <= 0 {
-		// log.Fatalf("[FATAL] Size of inline data too smaler: size=%d, num_tags=%d, aux_data=%d", len(responseData), numTags, auxDataSize)
-		log.Printf("[WARN] Size of inline data too small (fake cache?): size=%d, num_tags=%d, aux_data=%d\n", len(responseData), numTags, auxDataSize)
+		log.Fatalf("[FATAL] Size of inline data too smaler: size=%d, num_tags=%d, aux_data=%d", len(responseData), numTags, auxDataSize)
+		// log.Printf("[WARN] Size of inline data too small (fake cache?): size=%d, num_tags=%d, aux_data=%d\n", len(responseData), numTags, auxDataSize)
 	}
 	tags := make([]uint64, numTags)
 	for i := 0; i < numTags; i++ {
@@ -707,31 +764,31 @@ func buildLogEntryFromReadResponse(response []byte) *types.LogEntry {
 	}
 }
 
-func buildCCLogEntryFromLogRead(response []byte) *types.CCLogEntry {
-	seqNum := protocol.GetLogSeqNumFromMessage(response)
-	// numTags := protocol.GetLogNumTagsFromMessage(response)
-	// auxDataSize := protocol.GetLogAuxDataSizeFromMessage(response)
-	logData := protocol.GetInlineDataFromMessage(response)
-	// responseData := protocol.GetInlineDataFromMessage(response)
-	// logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
-	return &types.CCLogEntry{
-		SeqNum: seqNum,
-		Data:   logData,
-	}
-}
+// func buildCCLogEntryFromLogRead(response []byte) *types.CCLogEntry {
+// 	seqNum := protocol.GetLogSeqNumFromMessage(response)
+// 	// numTags := protocol.GetLogNumTagsFromMessage(response)
+// 	// auxDataSize := protocol.GetLogAuxDataSizeFromMessage(response)
+// 	logData := protocol.GetInlineDataFromMessage(response)
+// 	// responseData := protocol.GetInlineDataFromMessage(response)
+// 	// logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
+// 	return &types.CCLogEntry{
+// 		SeqNum: seqNum,
+// 		Data:   logData,
+// 	}
+// }
 
-func buildCCLogEntryFromCacheRead(response []byte) *types.CCLogEntry {
-	seqNum := protocol.GetLogSeqNumFromMessage(response)
-	// numTags := protocol.GetLogNumTagsFromMessage(response)
-	// auxDataSize := protocol.GetLogAuxDataSizeFromMessage(response)
-	cacheData := protocol.GetInlineDataFromMessage(response)
-	// responseData := protocol.GetInlineDataFromMessage(response)
-	// logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
-	return &types.CCLogEntry{
-		SeqNum:  seqNum,
-		AuxData: cacheData,
-	}
-}
+// func buildCCLogEntryFromCacheRead(response []byte) *types.CCLogEntry {
+// 	seqNum := protocol.GetLogSeqNumFromMessage(response)
+// 	// numTags := protocol.GetLogNumTagsFromMessage(response)
+// 	// auxDataSize := protocol.GetLogAuxDataSizeFromMessage(response)
+// 	cacheData := protocol.GetInlineDataFromMessage(response)
+// 	// responseData := protocol.GetInlineDataFromMessage(response)
+// 	// logDataSize := len(responseData) - numTags*protocol.SharedLogTagByteSize - auxDataSize
+// 	return &types.CCLogEntry{
+// 		SeqNum:  seqNum,
+// 		AuxData: cacheData,
+// 	}
+// }
 
 func (w *FuncWorker) sharedLogReadCommon(ctx context.Context, message []byte, opId uint64) (*types.LogEntry, error) {
 	// count := atomic.AddInt32(&w.sharedLogReadCount, int32(1))
@@ -794,68 +851,68 @@ func (w *FuncWorker) SharedLogReadPrev(ctx context.Context, tag uint64, seqNum u
 	return w.sharedLogReadCommon(ctx, message, id)
 }
 
-func (w *FuncWorker) SLogCCReadPrev(ctx context.Context, tag uint64, seqNum uint64) (*types.CCLogEntry, error) {
-	id := atomic.AddUint64(&w.nextLogOpId, 1)
-	currentCallId := atomic.LoadUint64(&w.currentCall)
-	message := protocol.NewSLogCCReadMessage(currentCallId, w.clientId, tag, seqNum, id)
+// func (w *FuncWorker) SLogCCReadPrev(ctx context.Context, tag uint64, seqNum uint64) (*types.CCLogEntry, error) {
+// 	id := atomic.AddUint64(&w.nextLogOpId, 1)
+// 	currentCallId := atomic.LoadUint64(&w.currentCall)
+// 	message := protocol.NewSLogCCReadMessage(currentCallId, w.clientId, tag, seqNum, id)
 
-	w.mux.Lock()
-	outputChan := make(chan []byte, 1)
-	w.outgoingLogOps[id] = outputChan
-	_, err := w.outputPipe.Write(message)
-	w.mux.Unlock()
-	if err != nil {
-		return nil, err
-	}
+// 	w.mux.Lock()
+// 	outputChan := make(chan []byte, 1)
+// 	w.outgoingLogOps[id] = outputChan
+// 	_, err := w.outputPipe.Write(message)
+// 	w.mux.Unlock()
+// 	if err != nil {
+// 		return nil, err
+// 	}
 
-	var response []byte
-	select {
-	case <-ctx.Done():
-		return nil, nil
-	case response = <-outputChan:
-	}
-	result := protocol.GetSharedLogResultTypeFromMessage(response)
-	if result == protocol.SharedLogResultType_READ_OK {
-		return buildCCLogEntryFromLogRead(response), nil
-	} else if result == protocol.SharedLogCCResultType_CACHED {
-		return buildCCLogEntryFromCacheRead(response), nil
-	} else if result == protocol.SharedLogResultType_EMPTY {
-		return nil, nil
-	} else {
-		return nil, fmt.Errorf("failed to read log tag=%d seqNum=%d", tag, seqNum)
-	}
-}
+// 	var response []byte
+// 	select {
+// 	case <-ctx.Done():
+// 		return nil, nil
+// 	case response = <-outputChan:
+// 	}
+// 	result := protocol.GetSharedLogResultTypeFromMessage(response)
+// 	if result == protocol.SharedLogResultType_READ_OK {
+// 		return buildCCLogEntryFromLogRead(response), nil
+// 	} else if result == protocol.SharedLogCCResultType_CACHED {
+// 		return buildCCLogEntryFromCacheRead(response), nil
+// 	} else if result == protocol.SharedLogResultType_EMPTY {
+// 		return nil, nil
+// 	} else {
+// 		return nil, fmt.Errorf("failed to read log tag=%d seqNum=%d", tag, seqNum)
+// 	}
+// }
 
-func (w *FuncWorker) SLogCCSetAuxData(ctx context.Context, tag uint64, seqNum uint64, auxData []byte) error {
-	if len(auxData) == 0 {
-		return fmt.Errorf("Auxiliary data cannot be empty")
-	}
-	if len(auxData) > protocol.MessageInlineDataSize {
-		return fmt.Errorf("Auxiliary data too larger (size=%d), expect no more than %d bytes", len(auxData), protocol.MessageInlineDataSize)
-	}
+// func (w *FuncWorker) SLogCCSetAuxData(ctx context.Context, tag uint64, seqNum uint64, auxData []byte) error {
+// 	if len(auxData) == 0 {
+// 		return fmt.Errorf("Auxiliary data cannot be empty")
+// 	}
+// 	if len(auxData) > protocol.MessageInlineDataSize {
+// 		return fmt.Errorf("Auxiliary data too larger (size=%d), expect no more than %d bytes", len(auxData), protocol.MessageInlineDataSize)
+// 	}
 
-	id := atomic.AddUint64(&w.nextLogOpId, 1)
-	currentCallId := atomic.LoadUint64(&w.currentCall)
-	message := protocol.NewSlogCCSetAuxDataMessage(currentCallId, w.clientId, tag, seqNum, id)
-	protocol.FillInlineDataInMessage(message, auxData)
+// 	id := atomic.AddUint64(&w.nextLogOpId, 1)
+// 	currentCallId := atomic.LoadUint64(&w.currentCall)
+// 	message := protocol.NewSlogCCSetAuxDataMessage(currentCallId, w.clientId, tag, seqNum, id)
+// 	protocol.FillInlineDataInMessage(message, auxData)
 
-	w.mux.Lock()
-	outputChan := make(chan []byte, 1)
-	w.outgoingLogOps[id] = outputChan
-	_, err := w.outputPipe.Write(message)
-	w.mux.Unlock()
-	if err != nil {
-		return err
-	}
+// 	w.mux.Lock()
+// 	outputChan := make(chan []byte, 1)
+// 	w.outgoingLogOps[id] = outputChan
+// 	_, err := w.outputPipe.Write(message)
+// 	w.mux.Unlock()
+// 	if err != nil {
+// 		return err
+// 	}
 
-	response := <-outputChan
-	result := protocol.GetSharedLogResultTypeFromMessage(response)
-	if result == protocol.SharedLogResultType_AUXDATA_OK {
-		return nil
-	} else {
-		return fmt.Errorf("Failed to set auxiliary data for log (seqnum %#016x)", seqNum)
-	}
-}
+// 	response := <-outputChan
+// 	result := protocol.GetSharedLogResultTypeFromMessage(response)
+// 	if result == protocol.SharedLogResultType_AUXDATA_OK {
+// 		return nil
+// 	} else {
+// 		return fmt.Errorf("Failed to set auxiliary data for log (seqnum %#016x)", seqNum)
+// 	}
+// }
 
 // Implement types.Environment
 func (w *FuncWorker) SharedLogCheckTail(ctx context.Context, tag uint64) (*types.LogEntry, error) {

@@ -15,8 +15,7 @@ namespace faas { namespace log {
 template <class T>
 class ProtoBuffer {
 public:
-    // ProtoBuffer();
-    absl::Mutex buffer_mu_;
+    // absl::Mutex buffer_mu_;
     // always starts from 0; seqnum of proto should be lowhalf
     size_t buffer_position_ = 0;
     utils::SimpleObjectPool<T> proto_pool_;
@@ -32,37 +31,32 @@ public:
     void Recycle(std::vector<T*>& protos);
 };
 
-// template <>
-// ProtoBuffer<MetaLogProto>::ProtoBuffer()
-//     : buffer_position_(0)
-// {}
-
 template <class T>
 void
 ProtoBuffer<T>::ProvideRaw(std::span<const char> payload)
 {
     T* proto = proto_pool_.Get();
     proto->ParseFromArray(payload.data(), static_cast<int>(payload.size()));
-    if (currentPosition(proto) < buffer_position_ ||
-        pending_protos_.contains(currentPosition(proto)))
-    {
+    size_t pos = currentPosition(proto);
+    if (pos < buffer_position_ || pending_protos_.contains(pos)) {
+        proto_pool_.Return(proto);
         return;
     }
-    pending_protos_[currentPosition(proto)] = proto;
+    pending_protos_[pos] = proto;
 }
 
 template <class T>
 void
 ProtoBuffer<T>::ProvideAllocated(T* proto)
 {
-    if (currentPosition(proto) < buffer_position_ ||
-        pending_protos_.contains(currentPosition(proto)))
-    {
+    size_t pos = currentPosition(proto);
+    if (pos < buffer_position_ || pending_protos_.contains(pos)) {
         return;
     }
     T* buf = proto_pool_.Get();
-    buf->Swap(proto);
-    pending_protos_[currentPosition(buf)] = buf;
+    // buf->Swap(proto);
+    *buf = std::move(*proto);
+    pending_protos_[pos] = buf;
 }
 
 template <class T>
@@ -92,7 +86,7 @@ template <class T>
 void
 ProtoBuffer<T>::Recycle(std::vector<T*>& protos)
 {
-    absl::MutexLock lk(&buffer_mu_);
+    // absl::MutexLock lk(&buffer_mu_);
     for (T* proto: protos) {
         proto_pool_.Return(proto);
     }

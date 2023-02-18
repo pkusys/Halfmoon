@@ -121,6 +121,10 @@ MetaLogPrimary::UpdateReplicaProgress(uint16_t sequencer_id,
     }
     DCHECK(metalog_progresses_.contains(sequencer_id));
     if (metalog_position > metalog_progresses_[sequencer_id]) {
+        HVLOG(1) << fmt::format("Replica {} progress: {} -> {}",
+                                sequencer_id,
+                                metalog_progresses_[sequencer_id],
+                                metalog_position);
         metalog_progresses_[sequencer_id] = metalog_position;
         UpdateMetaLogReplicatedPosition();
     }
@@ -175,14 +179,20 @@ MetaLogPrimary::UpdateMetaLogReplicatedPosition()
     }
     std::vector<uint32_t> tmp;
     tmp.reserve(metalog_progresses_.size());
+    std::string progress_str = "metalog progress: ";
     for (const auto& [sequencer_id, progress]: metalog_progresses_) {
         tmp.push_back(progress);
+        progress_str += fmt::format("{}:{} ", sequencer_id, progress);
     }
     absl::c_sort(tmp);
     uint32_t progress = tmp.at(tmp.size() / 2);
     DCHECK_GE(progress, replicated_metalog_position_);
     DCHECK_LE(progress, metalog_position_);
     replicated_metalog_position_ = progress;
+    HVLOG(1) << progress_str
+             << fmt::format("replicated {}/{}",
+                            replicated_metalog_position_,
+                            metalog_position_);
 }
 
 uint32_t

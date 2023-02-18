@@ -208,7 +208,7 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
     op->start_timestamp = GetMonotonicMicroTimestamp();
     op->client_id = message.log_client_id;
     op->client_data = message.log_client_data;
-    // op->call_id = func_call.call_id;
+    op->call_id = func_call.call_id;
     op->func_call_id = func_call.full_call_id;
     op->user_logspace = ctx.user_logspace;
     op->metalog_progress = ctx.metalog_progress;
@@ -266,7 +266,6 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
     //                         op->client_id,
     //                         op->type,
     //                         op->user_tags);
-
     LocalOpHandler(op);
 }
 

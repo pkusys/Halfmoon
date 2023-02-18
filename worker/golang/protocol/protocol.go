@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"encoding/binary"
-	"fmt"
 )
 
 type FuncCall struct {
@@ -56,12 +55,10 @@ const (
 	SharedLogOpType_TRIM        uint16 = 0x04
 	SharedLogOpType_SET_AUXDATA uint16 = 0x05
 	SharedLogOpType_READ_NEXT_B uint16 = 0x06
-	// concurrency control
-	SharedLogCCType_TXN_START  uint16 = 0x07
-	SharedLogCCType_TXN_COMMIT uint16 = 0x08
-	// SharedLogCCType_TXN_ABORT  uint16 = 0x09
-	SharedLogCCType_READ_LOCK  uint16 = 0x0A
-	SharedLogCCType_WRITE_LOCK uint16 = 0x0B
+	// txn
+	SharedLogOpType_CC_TXN_START  uint16 = 0x07
+	SharedLogOpType_CC_TXN_COMMIT uint16 = 0x08
+	SharedLogOpType_CC_TXN_WRITE  uint16 = 0x09
 )
 
 // SharedLogResultType enum
@@ -79,14 +76,6 @@ const (
 	SharedLogResultType_EMPTY       uint16 = 0x32
 	SharedLogResultType_DATA_LOST   uint16 = 0x33
 	SharedLogResultType_TRIM_FAILED uint16 = 0x34
-	// Concurrency control results
-	// start, commit: append_ok/discarded
-	// lock: append_ok/discarded/aborted
-	// SharedLogCCResultType_COMMITED    uint16 = 0x40
-	SharedLogCCResultType_CACHED  uint16 = 0x40
-	SharedLogCCResultType_ABORTED uint16 = 0x41
-	// SharedLogCCResultType_LOCK_OK     uint16 = 0x42
-	// SharedLogCCResultType_LOCK_FAILED uint16 = 0x43
 )
 
 const MaxLogSeqnum = uint64(0xffff000000000000)
@@ -107,7 +96,7 @@ const (
 	FLAG_FuncWorkerUseEngineSocket uint32 = (1 << 0)
 	FLAG_UseFifoForNestedCall      uint32 = (1 << 1)
 	FLAG_kAsyncInvokeFuncFlag      uint32 = (1 << 2)
-	FLAG_kMsgIsCCOpFlag            uint32 = (1 << 3) // used in read, set_auxdata
+	FLAG_kMsgIsCondOpFlag          uint32 = (1 << 3)
 )
 
 func GetFlagsFromMessage(buffer []byte) uint32 {
@@ -220,29 +209,29 @@ func NewFuncCallFailedMessage(funcCall FuncCall) []byte {
 	return buffer
 }
 
-func NewSLogCCTxnStartMessage(currentCallId uint64, myClientId uint16, clientData uint64) []byte {
-	buffer := NewEmptyMessage()
-	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
-	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogCCType_TXN_START)
-	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
-	// binary.LittleEndian.PutUint16(buffer[36:38], numTags)
-	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
-	return buffer
-}
+// func NewSLogCCTxnStartMessage(currentCallId uint64, myClientId uint16, clientData uint64) []byte {
+// 	buffer := NewEmptyMessage()
+// 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
+// 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
+// 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogCCType_TXN_START)
+// 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
+// 	// binary.LittleEndian.PutUint16(buffer[36:38], numTags)
+// 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+// 	return buffer
+// }
 
-func NewSLogCCTxnCommitMessage(currentCallId uint64, myClientId uint16, txnId uint64, seqNum uint64, clientData uint64) []byte {
-	buffer := NewEmptyMessage()
-	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
-	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-	binary.LittleEndian.PutUint64(buffer[8:16], seqNum)
-	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogCCType_TXN_COMMIT)
-	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
-	// binary.LittleEndian.PutUint16(buffer[36:38], numTags)
-	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
-	binary.LittleEndian.PutUint64(buffer[56:64], txnId)
-	return buffer
-}
+// func NewSLogCCTxnCommitMessage(currentCallId uint64, myClientId uint16, txnId uint64, seqNum uint64, clientData uint64) []byte {
+// 	buffer := NewEmptyMessage()
+// 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
+// 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
+// 	binary.LittleEndian.PutUint64(buffer[8:16], seqNum)
+// 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogCCType_TXN_COMMIT)
+// 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
+// 	// binary.LittleEndian.PutUint16(buffer[36:38], numTags)
+// 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+// 	binary.LittleEndian.PutUint64(buffer[56:64], txnId)
+// 	return buffer
+// }
 
 func NewSharedLogAppendMessage(currentCallId uint64, myClientId uint16, numTags uint16, clientData uint64) []byte {
 	buffer := NewEmptyMessage()
@@ -255,18 +244,32 @@ func NewSharedLogAppendMessage(currentCallId uint64, myClientId uint16, numTags 
 	return buffer
 }
 
-func NewSLogCCReadMessage(currentCallId uint64, myClientId uint16, tag uint64, batchId uint64, clientData uint64) []byte {
+func NewSharedLogConditionalAppendMessage(currentCallId uint64, myClientId uint16, numTags uint16, clientData uint64, condTag uint64, condPos uint32) []byte {
 	buffer := NewEmptyMessage()
 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-	binary.LittleEndian.PutUint64(buffer[8:16], batchId)
-	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCCOpFlag)
-	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_READ_PREV)
+	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCondOpFlag)
+	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_APPEND)
 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
-	binary.LittleEndian.PutUint64(buffer[40:48], tag)
+	binary.LittleEndian.PutUint16(buffer[36:38], numTags)
+	binary.LittleEndian.PutUint64(buffer[40:48], condTag)
 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+	binary.LittleEndian.PutUint32(buffer[56:60], condPos)
 	return buffer
 }
+
+// func NewSLogCCReadMessage(currentCallId uint64, myClientId uint16, tag uint64, batchId uint64, clientData uint64) []byte {
+// 	buffer := NewEmptyMessage()
+// 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
+// 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
+// 	binary.LittleEndian.PutUint64(buffer[8:16], batchId)
+// 	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCCOpFlag)
+// 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_READ_PREV)
+// 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
+// 	binary.LittleEndian.PutUint64(buffer[40:48], tag)
+// 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+// 	return buffer
+// }
 
 func NewSharedLogReadMessage(currentCallId uint64, myClientId uint16, tag uint64, seqNum uint64, direction int, block bool, clientData uint64) []byte {
 	buffer := NewEmptyMessage()
@@ -288,18 +291,18 @@ func NewSharedLogReadMessage(currentCallId uint64, myClientId uint16, tag uint64
 	return buffer
 }
 
-func NewSlogCCSetAuxDataMessage(currentCallId uint64, myClientId uint16, tag uint64, batchId uint64, clientData uint64) []byte {
-	buffer := NewEmptyMessage()
-	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
-	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-	binary.LittleEndian.PutUint64(buffer[8:16], batchId)
-	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCCOpFlag)
-	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_SET_AUXDATA)
-	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
-	binary.LittleEndian.PutUint64(buffer[40:48], tag)
-	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
-	return buffer
-}
+// func NewSlogCCSetAuxDataMessage(currentCallId uint64, myClientId uint16, tag uint64, batchId uint64, clientData uint64) []byte {
+// 	buffer := NewEmptyMessage()
+// 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
+// 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
+// 	binary.LittleEndian.PutUint64(buffer[8:16], batchId)
+// 	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCCOpFlag)
+// 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_SET_AUXDATA)
+// 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
+// 	binary.LittleEndian.PutUint64(buffer[40:48], tag)
+// 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+// 	return buffer
+// }
 
 func NewSharedLogSetAuxDataMessage(currentCallId uint64, myClientId uint16, seqNum uint64, clientData uint64) []byte {
 	buffer := NewEmptyMessage()
@@ -359,39 +362,39 @@ func BuildLogTagsBuffer(tags []uint64) []byte {
 	return buffer
 }
 
-const (
-	txnCommitHeaderSize = 24
-)
+// const (
+// 	txnCommitHeaderSize = 24
+// )
 
-func NewTxnCommitHeader(txnId uint64, seqNum uint64, readSet []uint64, writeSet []uint64) []byte {
-	buffer := make([]byte, txnCommitHeaderSize+len(readSet)*SharedLogTagByteSize+len(writeSet)*SharedLogTagByteSize)
-	binary.LittleEndian.PutUint64(buffer[0:8], txnId)
-	binary.LittleEndian.PutUint64(buffer[8:16], seqNum)
-	binary.LittleEndian.PutUint16(buffer[16:18], uint16(len(readSet)))
-	binary.LittleEndian.PutUint16(buffer[18:20], uint16(len(writeSet)))
-	bufIndex := txnCommitHeaderSize
-	for i := 0; i < len(readSet); i++ {
-		binary.LittleEndian.PutUint64(buffer[bufIndex:bufIndex+SharedLogTagByteSize], readSet[i])
-		bufIndex += SharedLogTagByteSize
-	}
-	for i := 0; i < len(writeSet); i++ {
-		binary.LittleEndian.PutUint64(buffer[bufIndex:bufIndex+SharedLogTagByteSize], writeSet[i])
-		bufIndex += SharedLogTagByteSize
-	}
-	return buffer
-}
+// func NewTxnCommitHeader(txnId uint64, seqNum uint64, readSet []uint64, writeSet []uint64) []byte {
+// 	buffer := make([]byte, txnCommitHeaderSize+len(readSet)*SharedLogTagByteSize+len(writeSet)*SharedLogTagByteSize)
+// 	binary.LittleEndian.PutUint64(buffer[0:8], txnId)
+// 	binary.LittleEndian.PutUint64(buffer[8:16], seqNum)
+// 	binary.LittleEndian.PutUint16(buffer[16:18], uint16(len(readSet)))
+// 	binary.LittleEndian.PutUint16(buffer[18:20], uint16(len(writeSet)))
+// 	bufIndex := txnCommitHeaderSize
+// 	for i := 0; i < len(readSet); i++ {
+// 		binary.LittleEndian.PutUint64(buffer[bufIndex:bufIndex+SharedLogTagByteSize], readSet[i])
+// 		bufIndex += SharedLogTagByteSize
+// 	}
+// 	for i := 0; i < len(writeSet); i++ {
+// 		binary.LittleEndian.PutUint64(buffer[bufIndex:bufIndex+SharedLogTagByteSize], writeSet[i])
+// 		bufIndex += SharedLogTagByteSize
+// 	}
+// 	return buffer
+// }
 
-func ParseTxnCommitPayload(data []byte) ([]byte, error) {
-	if len(data) < txnCommitHeaderSize {
-		return nil, fmt.Errorf("TxnCommit len %v has incomplete header", len(data))
-	}
-	nRead := int(binary.LittleEndian.Uint16(data[16:18]))
-	nWrite := int(binary.LittleEndian.Uint16(data[18:20]))
-	payloadStart := txnCommitHeaderSize + nRead*SharedLogTagByteSize + nWrite*SharedLogTagByteSize
-	if len(data) < payloadStart {
-		return nil, fmt.Errorf("TxnCommit has incomplete read write sets")
-	} else if len(data) == payloadStart {
-		return nil, fmt.Errorf("TxnCommit has empty payload")
-	}
-	return data[payloadStart:], nil
-}
+// func ParseTxnCommitPayload(data []byte) ([]byte, error) {
+// 	if len(data) < txnCommitHeaderSize {
+// 		return nil, fmt.Errorf("TxnCommit len %v has incomplete header", len(data))
+// 	}
+// 	nRead := int(binary.LittleEndian.Uint16(data[16:18]))
+// 	nWrite := int(binary.LittleEndian.Uint16(data[18:20]))
+// 	payloadStart := txnCommitHeaderSize + nRead*SharedLogTagByteSize + nWrite*SharedLogTagByteSize
+// 	if len(data) < payloadStart {
+// 		return nil, fmt.Errorf("TxnCommit has incomplete read write sets")
+// 	} else if len(data) == payloadStart {
+// 		return nil, fmt.Errorf("TxnCommit has empty payload")
+// 	}
+// 	return data[payloadStart:], nil
+// }

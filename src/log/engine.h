@@ -117,7 +117,7 @@ public:
     void FinishCondOps(CondOpResultVec& cond_op_results);
 
     absl::Mutex index_mu_;
-    std::atomic<uint32_t> indexed_seqnum_;
+    uint32_t indexed_seqnum_;
     absl::flat_hash_map</* seqnum */ uint32_t, IndexInfo> seqnum_info_;
     absl::flat_hash_map</* tag */ uint64_t, std::vector<uint32_t>> seqnums_by_tag_;
     // query
@@ -160,7 +160,7 @@ public:
         pending_kvs_reads_;
 
     void ProcessFinishedOp(LocalOp* op);
-    void ProcessIndexQueryResult(TxnEngine::IndexInfo& index_info, LocalOp* op);
+    void ProcessIndexQueryResults(TxnEngine::IndexInfo& index_info, LocalOp* op);
     void ReadFromKVS(LocalOp* op);
     void ReadFromLog(LocalOp* op);
     void ProcessKVSReadResult(const protocol::SharedLogMessage& message,
@@ -209,10 +209,10 @@ private:
 
     void OnRecvNewIndexData(const protocol::SharedLogMessage& message,
                             std::span<const char> payload) override;
-    void SLogRecvNewIndexData(const protocol::SharedLogMessage& message,
-                              std::span<const char> payload);
-    void TxnEngineRecvNewIndexData(const protocol::SharedLogMessage& message,
-                                   std::span<const char> payload);
+    void SLogRecvIndex(const protocol::SharedLogMessage& message,
+                       std::span<const char> payload);
+    void TxnEngineRecvIndex(const protocol::SharedLogMessage& message,
+                            std::span<const char> payload);
 
     void OnRecvResponse(const protocol::SharedLogMessage& message,
                         std::span<const char> payload) override;

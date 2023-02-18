@@ -26,7 +26,7 @@ struct LocalOp {
     bool is_cond_op;
     protocol::SharedLogOpType type;
     uint16_t client_id;
-    // uint32_t call_id;
+    uint32_t call_id;
     uint32_t user_logspace;
     // uint32_t logspace_id;
     uint32_t cond_pos;
@@ -59,6 +59,7 @@ NewCCReplicateMessage(log::LocalOp* op)
     if (op->is_cond_op) {
         message.cond_tag = op->cond_tag;
         message.cond_pos = op->cond_pos;
+        // not actually used, if non-zero cond_tag implies this is a log of a cond op
         message.flags |= protocol::kSLogIsCondOpFlag;
     }
     // else, cond_tag=0(kEmtpy)

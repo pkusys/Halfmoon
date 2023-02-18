@@ -409,7 +409,7 @@ public:
             return;
         }
         size_t tail = static_cast<size_t>(message->payload_size);
-        DCHECK(tail + total_size <= MESSAGE_INLINE_DATA_SIZE);
+        CHECK(tail + total_size <= MESSAGE_INLINE_DATA_SIZE);
         message->payload_size = gsl::narrow_cast<int32_t>(tail + total_size);
         memcpy(message->inline_data + tail, data.data(), total_size);
     }

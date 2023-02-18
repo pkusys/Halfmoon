@@ -39,6 +39,7 @@ public:
     inline void OnItemsPersisted(size_t num_persisted)
     {
         persisted_offset_ += num_persisted;
+        TrimPersistedItems();
     }
 
     inline std::shared_ptr<ValueType> Get(const KeyType& key) const

@@ -352,7 +352,8 @@ void HttpConnection::SendHttpResponse(HttpStatus status, std::span<const char> b
     ));
 }
 
-void HttpConnection::OnFuncCallFinishedInternal() {
+void HttpConnection::
+OnFuncCallFinishedInternal() {
     DCHECK(io_worker_->WithinMyEventLoopThread());
     if (state_ != kRunning) {
         HLOG(WARNING) << "HttpConnection is closing or has closed, will not send response";

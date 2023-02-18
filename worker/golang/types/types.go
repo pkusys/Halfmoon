@@ -39,14 +39,8 @@ type Environment interface {
 	SharedLogCheckTail(ctx context.Context, tag uint64) (*LogEntry, error)
 	// Set auxiliary data for log entry of given `seqNum`
 	SharedLogSetAuxData(ctx context.Context, seqNum uint64, auxData []byte) error
-	// Concurrency control
-	// common
-	SLogCCReadPrev(ctx context.Context, tag uint64, seqNum uint64) (*CCLogEntry, error)
-	SLogCCSetAuxData(ctx context.Context, tag uint64, seqNum uint64, auxData []byte) error
-	// occ
-	SLogCCTxnStart(ctx context.Context) ( /* txn_id,seqnum */ uint64, uint64, error)
-	SLogCCTxnCommit(ctx context.Context, txnId uint64, seqNum uint64, data []byte) ( /* seqnum */ uint64, error)
-	// lock here
+	// Conditional append, succeed only if the position of this log on the stream of `condTag` equals to `condPos`
+	SharedLogConditionalAppend(ctx context.Context, tags []uint64, data []byte, condTag uint64, condPos uint32) ( /* seqnum */ uint64, error)
 }
 
 type FuncHandler interface {

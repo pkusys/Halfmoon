@@ -1,6 +1,7 @@
 #include "log/storage.h"
 
 #include "absl/synchronization/mutex.h"
+#include "base/logging.h"
 #include "base/std_span.h"
 #include "common/protocol.h"
 #include "fmt/core.h"
@@ -52,7 +53,8 @@ InMemStore<KeyType, ValueType>::TrimPersistedItems()
     for (size_t i = 0; i < num_to_trim; i++) {
         store_.erase(live_keys_[i]);
     }
-    live_keys_.erase(live_keys_.begin(), live_keys_.begin() + num_to_trim);
+    live_keys_.erase(live_keys_.begin(),
+                     live_keys_.begin() + static_cast<long>(num_to_trim));
     persisted_offset_ -= num_to_trim;
 }
 
@@ -77,16 +79,19 @@ CCStorage::ApplyMetaLogs(std::vector<MetaLogProto*>& metalog_protos)
     index_data_.mutable_engine_indices()->Reserve(
         static_cast<int>(metalog_protos.size() * shard_progresses_.size()));
     for (MetaLogProto* metalog_proto: metalog_protos) {
-        // VLOG_F(1,
-        //        "Apply metalog: metalog_seqnum={}, start_seqnum={}",
-        //        metalog_proto->metalog_seqnum(),
-        //        start_seqnum);
+        VLOG_F(1,
+               "Apply metalog: metalog_seqnum={}, start_seqnum={}",
+               metalog_proto->metalog_seqnum(),
+               metalog_proto->new_logs_proto().start_seqnum());
         const auto& progress_vec = metalog_proto->new_logs_proto();
         uint32_t start_seqnum = progress_vec.start_seqnum();
         for (size_t i = 0; i < engine_node_ids.size(); i++) {
             uint16_t engine_id = engine_node_ids[i];
             uint32_t shard_start = progress_vec.shard_starts(static_cast<int>(i));
             uint32_t shard_delta = progress_vec.shard_deltas(static_cast<int>(i));
+            if (shard_delta == 0) {
+                continue;
+            }
             if (shard_progresses_.contains(engine_id)) {
                 ApplyMetaLogForEngine(start_seqnum,
                                       bits::JoinTwo32(engine_id, shard_start),
@@ -103,6 +108,15 @@ CCStorage::ApplyMetaLogForEngine(uint32_t start_seqnum,
                                  uint64_t start_localid,
                                  uint32_t shard_delta)
 {
+    VLOG(1) << fmt::format(
+        "Apply metalog for engine {}: seqnum {}->{}, localid {:#x}->{:#x}, "
+        "delta={}",
+        bits::HighHalf64(start_localid),
+        start_seqnum,
+        start_seqnum + shard_delta,
+        start_localid,
+        start_localid + shard_delta,
+        shard_delta);
     auto* engine_index = index_data_.mutable_engine_indices()->Add();
     engine_index->set_start_seqnum(start_seqnum);
     engine_index->set_start_localid(start_localid);
@@ -208,7 +222,7 @@ CCStorage::AdvanceShardProgress(uint16_t engine_id)
     }
     if (current > shard_progresses_[engine_id]) {
         VLOG_F(1,
-               "Update shard progres for engine {}: from={}, to={}",
+               "Update shard progress for engine {}: from={}, to={}",
                engine_id,
                bits::HexStr0x(shard_progresses_[engine_id]),
                bits::HexStr0x(current));
@@ -453,48 +467,23 @@ Storage::HandleCCReadLogRequest(const SharedLogMessage& request)
         HLOG(FATAL) << "CC storage not activated";
         return;
     }
+    HVLOG(1) << fmt::format(
+        "Handling CC log read at seqnum={:#x} localid={:#x}",
+        bits::JoinTwo32(request.logspace_id, request.seqnum_lowhalf),
+        request.localid);
     auto response = request;
     auto log_entry = cc_storage_->GetLog(request);
     if (!log_entry) {
+        HVLOG(1) << fmt::format(
+            "fetching CC log entry seqnum={:#x} localid={:#x} from DB",
+            bits::JoinTwo32(request.logspace_id, request.seqnum_lowhalf),
+            request.localid);
         ProcessCCReadLogFromDB(request, response);
     } else {
         response.op_result = static_cast<uint16_t>(SharedLogResultType::READ_OK);
         SendEngineResponse(request, &response, STRING_AS_SPAN(log_entry->data));
     }
 }
-
-// void
-// Storage::OnRecvCCReadAtRequest(const protocol::SharedLogMessage& request)
-// {
-//     LockablePtr<LogStorage> storage_ptr;
-//     {
-//         absl::ReaderMutexLock view_lk(&view_mu_);
-//         // ONHOLD_IF_FROM_FUTURE_VIEW(request, EMPTY_CHAR_SPAN);
-//         storage_ptr = storage_collection_.GetLogSpace(request.logspace_id);
-//     }
-//     if (storage_ptr == nullptr) {
-//         ProcessCCReadFromDB(request);
-//         return;
-//     }
-//     std::optional<std::shared_ptr<CCLogEntry>> cc_log_entry;
-//     LogStorage::ReadResultVec results;
-//     {
-//         auto locked_storage = storage_ptr.Lock();
-//         cc_log_entry = locked_storage->ReadCCLogEntry(request);
-//         // locked_storage->PollReadResults(&results);
-//     }
-//     if (cc_log_entry.has_value()) {
-//         auto response = SharedLogMessageHelper::NewReadOkResponse();
-//         log_utils::FillResponseMsgWithCCLogEntry(&response, cc_log_entry->get());
-//         response.user_metalog_progress = request.user_metalog_progress;
-//         response.txn_id = request.txn_id;
-//         SendEngineResponse(request,
-//                            &response,
-//                            STRING_AS_SPAN(cc_log_entry.value()->data));
-//     } else {
-//         ProcessCCReadFromDB(request);
-//     }
-// }
 
 void
 Storage::HandleReplicateRequest(const SharedLogMessage& message,
@@ -543,6 +532,12 @@ Storage::CCHandleReplicateRequest(const protocol::SharedLogMessage& request,
         HLOG(FATAL) << "CC storage not activated";
         return;
     }
+    HVLOG(1) << fmt::format(
+        "Replicate op type {:#x}: localid={:#x} cond_tag={} cond_pos={}",
+        request.op_type,
+        request.localid,
+        request.cond_tag,
+        request.cond_pos);
     auto log_entry = std::make_shared<CCLogEntry>();
     log_utils::PopulateCCLogEntry(request, payload, log_entry.get());
     // increment shard progress
@@ -610,23 +605,22 @@ Storage::CCRecvMetaLog(const SharedLogMessage& message,
         HLOG(FATAL) << "CC storage not activated";
         return;
     }
-    std::optional<std::vector<MetaLogProto*>> metalogs;
-    {
-        absl::MutexLock lk(&cc_storage_->metalog_buffer_.buffer_mu_);
-        cc_storage_->metalog_buffer_.ProvideRaw(payload);
-        metalogs = cc_storage_->metalog_buffer_.PollBuffer();
-    }
-    if (!metalogs) {
-        return;
-    }
     std::optional<PerStorageIndexProto> index_data;
     {
+        // absl::MutexLock lk(&cc_storage_->metalog_buffer_.buffer_mu_);
         absl::MutexLock lk(&cc_storage_->store_mu_);
+        cc_storage_->metalog_buffer_.ProvideRaw(payload);
+        auto metalogs = cc_storage_->metalog_buffer_.PollBuffer();
+        if (!metalogs) {
+            return;
+        }
         cc_storage_->ApplyMetaLogs(*metalogs);
+        cc_storage_->metalog_buffer_.Recycle(*metalogs);
         index_data = cc_storage_->PollIndexData();
     }
-    cc_storage_->metalog_buffer_.Recycle(*metalogs);
     if (index_data) {
+        VLOG(1) << fmt::format("sending index data for {} engines",
+                               index_data->engine_indices_size());
         CCSendIndexData(cc_storage_->view_, cc_storage_->logspace_id_, *index_data);
     }
 }
@@ -851,7 +845,7 @@ void
 Storage::CCSendShardProgress()
 {
     if (!cc_storage_) {
-        HLOG(FATAL) << "CC storage not activated";
+        // HLOG(FATAL) << "CC storage not activated";
         return;
     }
     uint32_t logspace_id;
@@ -861,6 +855,10 @@ Storage::CCSendShardProgress()
         cc_storage_->PollShardProgress(progress);
         logspace_id = cc_storage_->logspace_id_;
     }
+    if (progress.empty()) {
+        return;
+    }
+    HVLOG(1) << fmt::format("Sending shard progress {}", progress);
     SharedLogMessage message =
         SharedLogMessageHelper::NewShardProgressMessage(logspace_id);
     SendSequencerMessage(bits::LowHalf32(logspace_id),
@@ -915,7 +913,7 @@ void
 Storage::CCFlushToDB()
 {
     if (!cc_storage_) {
-        HLOG(FATAL) << "CC storage not activated";
+        // HLOG(FATAL) << "CC storage not activated";
         return;
     }
     uint32_t logspace_id;
