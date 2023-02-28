@@ -59,11 +59,9 @@ struct CCLogMetaData {
     uint16_t op_type;
     uint16_t num_tags;
     uint32_t cond_pos;
-    uint64_t cond_tag; // if not kInvalidLogTag, then this is cond op
-    // union {
-    //     uint64_t cond_tag;  // if not kInvalidLogTag, then this is cond op
-    //     uint64_t write_tag; // for async_write(cc_txn_write)
-    // };
+    uint64_t cond_tag; // if not kInvalidLogTag, then this is cond op, except when
+                       // op_type == OVERWRITE, where tag and pos specify the
+                       // position in which tag stream to overwrite
     // log_data size is implicit
 };
 

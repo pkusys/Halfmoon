@@ -1,25 +1,20 @@
 #pragma once
 
 #include "absl/synchronization/mutex.h"
-#include "base/logging.h"
 #include "common/protocol.h"
 #include "log/common.h"
-#include "log/engine_base.h"
 #include "log/view.h"
 #include "log/view_watcher.h"
 #include "proto/shared_log.pb.h"
 #include "utils/lockable_ptr.h"
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <sys/types.h>
-#include <vector>
 
 namespace faas { namespace log_utils {
 
 using log::UserTagVec;
 using log::CCLogMetaData;
 using log::CCLogEntry;
+using log::PerLogIndexProto;
+using protocol::SharedLogOpType;
 
 uint16_t GetViewId(uint64_t value);
 
@@ -263,6 +258,29 @@ PopulateCCMetaData(const protocol::SharedLogMessage& message,
     // {
     //     metadata->write_tag = message.query_tag;
     // }
+}
+
+inline int
+PopulateIndexFlags(const CCLogMetaData& metadata)
+{
+    int flags = 0;
+    switch (static_cast<SharedLogOpType>(metadata.op_type)) {
+    case SharedLogOpType::OVERWRITE:
+        flags |= PerLogIndexProto::OVERWRITE;
+        return flags;
+    case SharedLogOpType::CC_TXN_START:
+        flags |= PerLogIndexProto::TXN;
+        break;
+    case SharedLogOpType::APPEND:
+        flags |= PerLogIndexProto::APPEND;
+        break;
+    default:
+        UNREACHABLE();
+    }
+    if (metadata.cond_tag != log::kEmptyLogTag) {
+        flags |= PerLogIndexProto::CONDITIONAL;
+    }
+    return flags;
 }
 
 inline void

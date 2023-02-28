@@ -115,6 +115,7 @@ StorageBase::MessageHandler(const SharedLogMessage& message,
         break;
     case SharedLogOpType::APPEND:
     case SharedLogOpType::CC_TXN_START:
+    case SharedLogOpType::OVERWRITE:
         HandleReplicateRequest(message, payload);
         break;
     case SharedLogOpType::CC_TXN_WRITE:

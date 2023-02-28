@@ -150,7 +150,14 @@ message IndexDataProto {
 // }
 
 message PerLogIndexProto {
-    bool is_txn = 1;
+    enum Flag {
+        EMPTY = 0;
+        APPEND = 1;
+        TXN = 2;
+        OVERWRITE = 4;
+        CONDITIONAL = 8;
+    }
+    int32 flags = 1;
     uint32 cond_pos = 2;
     uint64 cond_tag = 3;
     repeated uint64 user_tags = 4;

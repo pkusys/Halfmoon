@@ -81,10 +81,9 @@ public:
 
     // indexed using localid
     struct IndexInfo {
-        bool is_txn;
-        uint16_t engine_id;
-        uint32_t localid_lowhalf; // high half is engine_id
-        uint64_t cond_tag;
+        uint16_t flags = 0;
+        uint64_t localid = 0;
+        uint64_t cond_tag = 0;
     };
     struct IndexQueryResult {
         IndexInfo index_info;
@@ -133,8 +132,10 @@ public:
     // optional indicates whether the read op blocks on future seqnum
     // op->seqnum contains the result; invalid indicates no such entry
     std::optional<IndexInfo> LookUp(LocalOp* op);
-    IndexInfo LookUpCurrentIndex(LocalOp* op);
-    std::optional<IndexInfo> LookUpFutureIndex(LocalOp* op);
+    std::optional<IndexInfo> LookUpBackward(LocalOp* op);
+    std::optional<IndexInfo> LookUpForward(LocalOp* op);
+    IndexInfo LookUpCurrentIndexBackward(LocalOp* op);
+    std::optional<IndexInfo> LookUpFutureIndexBackward(LocalOp* op);
 
     // // The following fields are for index compaction
     // // 1. active_seqnums are snapshots obtained at txn_start
@@ -151,7 +152,7 @@ public:
     explicit Engine(engine::Engine* engine);
     ~Engine();
 
-    std::unique_ptr<TxnEngine> txn_engine_;
+    std::unique_ptr<TxnEngine> txn_engine_ = nullptr;
     log_utils::ThreadSafeHashBucket<uint64_t /* localid */, LocalOp*>
         pending_log_reads_;
     log_utils::ThreadSafeHashBucket<

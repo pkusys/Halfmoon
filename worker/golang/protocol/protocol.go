@@ -59,6 +59,7 @@ const (
 	SharedLogOpType_CC_TXN_START  uint16 = 0x07
 	SharedLogOpType_CC_TXN_COMMIT uint16 = 0x08
 	SharedLogOpType_CC_TXN_WRITE  uint16 = 0x09
+	SharedLogOpType_OVERWRITE     uint16 = 0x0a
 )
 
 // SharedLogResultType enum
@@ -76,6 +77,7 @@ const (
 	SharedLogResultType_EMPTY       uint16 = 0x32
 	SharedLogResultType_DATA_LOST   uint16 = 0x33
 	SharedLogResultType_TRIM_FAILED uint16 = 0x34
+	SharedLogResultType_COND_FAILED uint16 = 0x35
 )
 
 const MaxLogSeqnum = uint64(0xffff000000000000)
@@ -96,7 +98,7 @@ const (
 	FLAG_FuncWorkerUseEngineSocket uint32 = (1 << 0)
 	FLAG_UseFifoForNestedCall      uint32 = (1 << 1)
 	FLAG_kAsyncInvokeFuncFlag      uint32 = (1 << 2)
-	FLAG_kMsgIsCondOpFlag          uint32 = (1 << 3)
+	FLAG_kConditionalOpFlag        uint32 = (1 << 3)
 )
 
 func GetFlagsFromMessage(buffer []byte) uint32 {
@@ -248,7 +250,7 @@ func NewSharedLogConditionalAppendMessage(currentCallId uint64, myClientId uint1
 	buffer := NewEmptyMessage()
 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCondOpFlag)
+	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kConditionalOpFlag)
 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_APPEND)
 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
 	binary.LittleEndian.PutUint16(buffer[36:38], numTags)
@@ -258,18 +260,17 @@ func NewSharedLogConditionalAppendMessage(currentCallId uint64, myClientId uint1
 	return buffer
 }
 
-// func NewSLogCCReadMessage(currentCallId uint64, myClientId uint16, tag uint64, batchId uint64, clientData uint64) []byte {
-// 	buffer := NewEmptyMessage()
-// 	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
-// 	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
-// 	binary.LittleEndian.PutUint64(buffer[8:16], batchId)
-// 	binary.LittleEndian.PutUint32(buffer[28:32], FLAG_kMsgIsCCOpFlag)
-// 	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_READ_PREV)
-// 	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
-// 	binary.LittleEndian.PutUint64(buffer[40:48], tag)
-// 	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
-// 	return buffer
-// }
+func NewSharedLogOverwriteMessage(currentCallId uint64, myClientId uint16, clientData uint64, tag uint64, pos uint32) []byte {
+	buffer := NewEmptyMessage()
+	tmp := (currentCallId << MessageTypeBits) + uint64(MessageType_SHARED_LOG_OP)
+	binary.LittleEndian.PutUint64(buffer[0:8], tmp)
+	binary.LittleEndian.PutUint16(buffer[32:34], SharedLogOpType_OVERWRITE)
+	binary.LittleEndian.PutUint16(buffer[34:36], myClientId)
+	binary.LittleEndian.PutUint64(buffer[40:48], tag)
+	binary.LittleEndian.PutUint64(buffer[48:56], clientData)
+	binary.LittleEndian.PutUint32(buffer[56:60], pos)
+	return buffer
+}
 
 func NewSharedLogReadMessage(currentCallId uint64, myClientId uint16, tag uint64, seqNum uint64, direction int, block bool, clientData uint64) []byte {
 	buffer := NewEmptyMessage()

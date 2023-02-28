@@ -124,7 +124,7 @@ public:
     explicit Storage(uint16_t node_id);
     ~Storage();
 
-    std::unique_ptr<CCStorage> cc_storage_;
+    std::unique_ptr<CCStorage> cc_storage_ = nullptr;
 
     // void OnRecvSLogReplicateRequest(const protocol::SharedLogMessage& message,
     //                                 std::span<const char> payload);

@@ -123,8 +123,6 @@ CCStorage::ApplyMetaLogForEngine(uint32_t start_seqnum,
     engine_index->mutable_log_indices()->Reserve(static_cast<int>(shard_delta));
     for (uint32_t i = 0; i < shard_delta; i++) {
         auto* log_index = engine_index->mutable_log_indices()->Add();
-        CHECK(log_index->user_tags_size() == 0 &&
-              log_index->cond_tag() == kEmptyLogTag);
         // mark as live, become candidate for persistence
         uint64_t localid = start_localid + i;
         uint64_t seqnum = bits::JoinTwo32(logspace_id_, start_seqnum + i);
@@ -138,8 +136,8 @@ CCStorage::ApplyMetaLogForEngine(uint32_t start_seqnum,
         // to the background thread
         log_store_.OnItemsPersisted(localid);
         // populate log index
-        log_index->set_is_txn(log_entry->metadata.op_type ==
-                              static_cast<uint16_t>(SharedLogOpType::CC_TXN_START));
+        int flags = log_utils::PopulateIndexFlags(log_entry->metadata);
+        log_index->set_flags(flags);
         log_index->set_cond_pos(log_entry->metadata.cond_pos);
         log_index->set_cond_tag(log_entry->metadata.cond_tag);
         log_index->mutable_user_tags()->Add(log_entry->user_tags.begin(),

@@ -134,7 +134,7 @@ TxnEngine::FinishOp(uint64_t localid, uint64_t seqnum, bool check_cond)
         return;
     }
     LocalOp* op = pending_ops_.at(localid);
-    if (check_cond && op->is_cond_op) {
+    if (op->conditional && check_cond) {
         return;
     }
     pending_ops_.erase(localid);
@@ -142,10 +142,14 @@ TxnEngine::FinishOp(uint64_t localid, uint64_t seqnum, bool check_cond)
     // Note: async_write has already returned to caller, no need to call
     // FinishOpWithResponse
     if (op->type == protocol::SharedLogOpType::CC_TXN_WRITE) {
-        auto& txn_progress = pending_txns_[bits::LowHalf64(op->seqnum)];
+        if (!pending_txns_.contains(bits::LowHalf64(op->seqnum))) {
+            return;
+        }
+        auto& txn_progress = pending_txns_.at(bits::LowHalf64(op->seqnum));
         LocalOp* commit_op = txn_progress->finishOp();
         if (commit_op != nullptr) {
             finished_ops_.push_back(commit_op);
+            pending_txns_.erase(bits::LowHalf64(op->seqnum));
         }
     } else {
         op->seqnum = seqnum;
@@ -203,7 +207,7 @@ TxnEngine::ApplyIndices(std::vector<PerEngineIndexProto*>& engine_indices)
             break;
         }
         LocalOp* op = iter->second;
-        IndexInfo index_info = LookUpCurrentIndex(op);
+        IndexInfo index_info = LookUpCurrentIndexBackward(op);
         pending_query_results_.push_back(IndexQueryResult{index_info, op});
     }
 }
@@ -214,33 +218,50 @@ TxnEngine::ApplyIndex(const PerLogIndexProto& log_index, uint64_t localid)
     uint16_t engine_id = gsl::narrow_cast<uint16_t>(bits::HighHalf64(localid));
     uint32_t seqnum_lowhalf = indexed_seqnum_++;
     // txn write has no tags
-    if (log_index.user_tags_size() == 0 && log_index.cond_tag() == kEmptyLogTag) {
+    if (log_index.flags() == PerLogIndexProto::EMPTY) {
         return;
     }
-    if (log_index.cond_tag() != kEmptyLogTag) {
+    if (log_index.flags() & PerLogIndexProto::OVERWRITE) {
+        uint32_t overwrite_seqnum_lowhalf =
+            seqnums_by_tag_[log_index.cond_tag()][log_index.cond_pos()];
+        seqnum_info_[overwrite_seqnum_lowhalf] = IndexInfo{
+            // .flags = 0,
+            .localid = localid,
+            // .cond_tag = log_index.cond_tag(),
+        };
+        return;
+    }
+    if (log_index.flags() & PerLogIndexProto::CONDITIONAL) {
         size_t pos = seqnums_by_tag_[log_index.cond_tag()].size();
-        bool cond_ok = pos == log_index.cond_pos();
-        if (engine_id == engine_id_) {
+        if (pos < log_index.cond_pos()) {
+            LOG(FATAL) << fmt::format("Invalid cond pos: current {}, expect {}",
+                                      pos,
+                                      log_index.cond_pos());
+        }
+        if (pos == log_index.cond_pos()) {
+            seqnums_by_tag_[log_index.cond_tag()].push_back(seqnum_lowhalf);
+        }
+        if (engine_id == engine_id_) { // pos >= log_index.cond_pos()
             cond_op_results_.push_back(CondOpResult{
                 .localid = localid,
-                .seqnum = cond_ok ? bits::JoinTwo32(logspace_id_, seqnum_lowhalf) :
-                                    kInvalidLogSeqNum,
-            });
+                .seqnum = pos == log_index.cond_pos() ?
+                              bits::JoinTwo32(logspace_id_, seqnum_lowhalf) :
+                              kInvalidLogSeqNum});
         }
-        if (!cond_ok) {
+        if (pos > log_index.cond_pos()) {
             return;
         }
-        seqnums_by_tag_[log_index.cond_tag()].push_back(seqnum_lowhalf);
     }
     for (uint64_t user_tag: log_index.user_tags()) {
         seqnums_by_tag_[user_tag].push_back(seqnum_lowhalf);
     }
     seqnum_info_[seqnum_lowhalf] = IndexInfo{
-        .is_txn = log_index.is_txn(),
-        .engine_id = engine_id,
-        .localid_lowhalf = bits::LowHalf64(localid),
+        .localid = localid,
         .cond_tag = log_index.cond_tag(),
     };
+    if (log_index.flags() & PerLogIndexProto::TXN) {
+        seqnum_info_[seqnum_lowhalf].flags |= protocol::kIndexIsTxnFlag;
+    }
 }
 
 void
@@ -255,24 +276,63 @@ TxnEngine::PollIndexQueryResults(IndexQueryResultVec& query_results)
     query_results.swap(pending_query_results_);
 }
 
-// NOTE: txns and functions should read prev with snapshot-1
 std::optional<TxnEngine::IndexInfo>
 TxnEngine::LookUp(LocalOp* op)
+{
+    if (op->type == SharedLogOpType::READ_PREV) {
+        return LookUpBackward(op);
+    }
+    // READ_NEXT
+    return LookUpForward(op);
+}
+
+std::optional<TxnEngine::IndexInfo>
+TxnEngine::LookUpForward(LocalOp* op)
+{
+    absl::ReaderMutexLock lk(&index_mu_);
+    DCHECK(logspace_id_ == bits::HighHalf64(op->seqnum));
+    // currently not supporting snapshot and single obj read
+    DCHECK(op->query_tag != kEmptyLogTag);
+    if (!seqnums_by_tag_.contains(op->query_tag)) {
+        op->seqnum = kInvalidLogSeqNum;
+        return IndexInfo{};
+    }
+    uint32_t query_seqnum_lowhalf = bits::LowHalf64(op->seqnum);
+    auto& index_of_tag = seqnums_by_tag_.at(op->query_tag);
+    auto iter = absl::c_lower_bound(
+        index_of_tag,
+        query_seqnum_lowhalf,
+        [](uint32_t index_seqnum, uint32_t query_seqnum_lowhalf) {
+            return index_seqnum < query_seqnum_lowhalf;
+        });
+    if (iter == index_of_tag.end()) {
+        op->seqnum = kInvalidLogSeqNum;
+        return IndexInfo{};
+    }
+    uint32_t result_seqnum_lowhalf = *iter;
+    op->seqnum = bits::JoinTwo32(logspace_id_, result_seqnum_lowhalf);
+    return seqnum_info_[result_seqnum_lowhalf];
+}
+
+// NOTE: txns and functions should read prev with snapshot-1
+// snapshot is obtained by appending txn_start and function invocation logs
+std::optional<TxnEngine::IndexInfo>
+TxnEngine::LookUpBackward(LocalOp* op)
 {
     // currently not supporting snapshot and single obj read prev
     // snapshot(read-only txn) and single obj(non-txn) returns the current tail
     {
         absl::ReaderMutexLock lk(&index_mu_);
         if (bits::JoinTwo32(logspace_id_, indexed_seqnum_) > op->seqnum) {
-            return LookUpCurrentIndex(op);
+            return LookUpCurrentIndexBackward(op);
         }
     }
     absl::MutexLock lk(&index_mu_);
-    return LookUpFutureIndex(op);
+    return LookUpFutureIndexBackward(op);
 }
 
 TxnEngine::IndexInfo
-TxnEngine::LookUpCurrentIndex(LocalOp* op)
+TxnEngine::LookUpCurrentIndexBackward(LocalOp* op)
 {
     // absl::ReaderMutexLock lk(&index_mu_);
     DCHECK(logspace_id_ == bits::HighHalf64(op->seqnum));
@@ -300,7 +360,7 @@ TxnEngine::LookUpCurrentIndex(LocalOp* op)
 }
 
 std::optional<TxnEngine::IndexInfo>
-TxnEngine::LookUpFutureIndex(LocalOp* op)
+TxnEngine::LookUpFutureIndexBackward(LocalOp* op)
 {
     // absl::MutexLock lk(&index_mu_);
     DCHECK(logspace_id_ == bits::HighHalf64(op->seqnum));
@@ -308,7 +368,7 @@ TxnEngine::LookUpFutureIndex(LocalOp* op)
     // snapshot(read-only txn) and single obj(non-txn) returns the current tail
     DCHECK(op->query_tag != kEmptyLogTag);
     if (bits::JoinTwo32(logspace_id_, indexed_seqnum_) > op->seqnum) {
-        return LookUpCurrentIndex(op);
+        return LookUpCurrentIndexBackward(op);
     }
     pending_queries_.insert(std::make_pair(bits::LowHalf64(op->seqnum), op));
     return std::nullopt;
@@ -494,13 +554,13 @@ Engine::HandleLocalCCTxnWrite(LocalOp* op)
         HLOG(FATAL) << "Txn engine not activated";
         return;
     }
-    uint64_t localid = txn_engine_->RegisterOp(op);
+    txn_engine_->RegisterOp(op);
     Message response =
         MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK);
     FinishLocalOpWithResponse(op, &response, false);
     HVLOG_F(1,
             "Handle local txn write: localid={:#x} seqnum={:#x} key={:#x}",
-            localid,
+            op->localid,
             op->seqnum,
             op->query_tag);
     auto message = NewCCTxnWriteMessage(op);
@@ -534,7 +594,7 @@ Engine::TxnEngineLocalAppend(LocalOp* op)
         HLOG(FATAL) << "Txn engine not activated";
         return;
     }
-    uint64_t localid = txn_engine_->RegisterOp(op);
+    txn_engine_->RegisterOp(op);
     HVLOG_F(
         1,
         "Handle local append op call_id {} type {:#x}: localid={:#x} cond_tag={} cond_pos={}",
@@ -552,7 +612,7 @@ Engine::TxnEngineLocalAppend(LocalOp* op)
     if (!success) {
         HLOG(FATAL) << "Failed to replicate txn start message";
     }
-    CCLogCachePut(localid, op->data.to_span());
+    CCLogCachePut(op->localid, op->data.to_span());
 }
 
 void
@@ -696,12 +756,14 @@ Engine::ProcessIndexQueryResults(TxnEngine::IndexInfo& index_info, LocalOp* op)
         FinishLocalOpWithFailure(op, SharedLogResultType::EMPTY);
         return;
     }
-    // TODO: process query_tag == kEmptyLogTag (snapshot); currently not supported
-    if (index_info.is_txn && op->query_tag != index_info.cond_tag) {
+    // TODO: process query_tag == kEmptyLogTag (snapshot); currently not
+    // supported
+    if ((index_info.flags & protocol::kIndexIsTxnFlag) &&
+        op->query_tag != index_info.cond_tag)
+    {
         ReadFromKVS(op);
     } else {
-        op->localid =
-            bits::JoinTwo32(index_info.engine_id, index_info.localid_lowhalf);
+        op->localid = index_info.localid;
         ReadFromLog(op);
     }
 }
@@ -933,18 +995,6 @@ Engine::SLogRecvMetaLog(const protocol::SharedLogMessage& message,
 void
 Engine::ProcessFinishedOp(LocalOp* op)
 {
-    // if cond op failed, then seqnum is kInvalidLogSeqNum
-    if (op->is_cond_op && op->seqnum == kInvalidLogSeqNum) {
-        FinishLocalOpWithFailure(op, SharedLogResultType::DISCARDED);
-        return;
-    }
-    if (op->type == SharedLogOpType::CC_TXN_WRITE) {
-        RecycleLocalOp(op);
-        return;
-    }
-    Message response =
-        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK,
-                                               op->seqnum);
     HVLOG(1) << fmt::format(
         "finished op type={:#x} localid={:#x} seqnum={:#x} cond_tag={} cond_pos={}",
         static_cast<uint16_t>(op->type),
@@ -952,6 +1002,18 @@ Engine::ProcessFinishedOp(LocalOp* op)
         op->seqnum,
         op->cond_tag,
         op->cond_pos);
+    if (op->type == SharedLogOpType::CC_TXN_WRITE) {
+        RecycleLocalOp(op);
+        return;
+    }
+    // if cond op failed, then seqnum is kInvalidLogSeqNum
+    if (op->conditional && op->seqnum == kInvalidLogSeqNum) {
+        FinishLocalOpWithFailure(op, SharedLogResultType::COND_FAILED);
+        return;
+    }
+    Message response =
+        MessageHelper::NewSharedLogOpSucceeded(SharedLogResultType::APPEND_OK,
+                                               op->seqnum);
     FinishLocalOpWithResponse(op, &response);
 }
 
@@ -990,9 +1052,9 @@ Engine::TxnEngineRecvIndex(const protocol::SharedLogMessage& message,
         }
         // apply and poll cond ops and pending reads
         // NOTE: for append ops, applying index only finishes cond ops, while
-        // applying metalog finishes none-cond ops though it is possible that index
-        // is ahead of metalog, and non-cond ops can be finished here, we leave that
-        // completely to metalog for clarity
+        // applying metalog finishes none-cond ops though it is possible that
+        // index is ahead of metalog, and non-cond ops can be finished here, we
+        // leave that completely to metalog for clarity
         txn_engine_->ApplyIndices(*engine_indices);
         txn_engine_->index_buffer_.Recycle(*engine_indices);
         txn_engine_->PollCondOpResults(cond_op_results);

@@ -124,6 +124,7 @@ EngineBase::LocalOpHandler(LocalOp* op)
     switch (op->type) {
     case SharedLogOpType::APPEND:
     case SharedLogOpType::CC_TXN_START:
+    case SharedLogOpType::OVERWRITE:
         HandleLocalAppend(op);
         break;
     case SharedLogOpType::READ_NEXT:
@@ -137,9 +138,6 @@ EngineBase::LocalOpHandler(LocalOp* op)
     case SharedLogOpType::SET_AUXDATA:
         HandleLocalSetAuxData(op);
         break;
-    // case SharedLogOpType::CC_TXN_START:
-    //     HandleLocalCCTxnStart(op);
-    //     break;
     case SharedLogOpType::CC_TXN_COMMIT:
         HandleLocalCCTxnCommit(op);
         break;
@@ -220,8 +218,8 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
 
     // cond_tag is either the history log tag for a function instance
     // or 0(kEmptyLogTag) for non-fault-tolerant functions
-    op->is_cond_op = (message.flags & protocol::kMsgIsCondOpFlag) != 0;
-    if (op->is_cond_op) {
+    op->conditional = (message.flags & protocol::kConditionalOpFlag) != 0;
+    if (op->conditional) {
         op->cond_tag = message.log_tag;
         op->cond_pos = message.cond_pos;
     } else {
@@ -245,7 +243,6 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
         break;
     case SharedLogOpType::SET_AUXDATA:
         op->seqnum = message.log_seqnum;
-        op->query_tag = message.log_tag;
         op->data.AppendData(MessageHelper::GetInlineData(message));
         break;
     case SharedLogOpType::CC_TXN_COMMIT:
@@ -257,6 +254,11 @@ EngineBase::OnMessageFromFuncWorker(const Message& message)
     case SharedLogOpType::CC_TXN_WRITE:
         op->seqnum = message.log_seqnum;
         op->query_tag = message.log_tag;
+        op->data.AppendData(MessageHelper::GetInlineData(message));
+        break;
+    case SharedLogOpType::OVERWRITE:
+        op->cond_tag = message.log_tag;
+        op->cond_pos = message.cond_pos;
         op->data.AppendData(MessageHelper::GetInlineData(message));
         break;
     default:

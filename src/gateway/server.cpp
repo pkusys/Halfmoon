@@ -458,15 +458,22 @@ Server::OnNewFuncCallCommon(
     bool dispatched = false;
     if (func_call_context->is_async()) {
         if (!node_picked) {
+            HVLOG(1) << "async func call node not picked: "
+                     << FuncCallHelper::DebugString(func_call);
             func_call_context->set_status(FuncCallContext::kSuccess);
         } else if (DispatchAsyncFuncCall(func_call,
                                          func_call_context->logspace(),
                                          func_call_context->input(),
                                          node_id))
         {
+            HVLOG(1) << fmt::format("async func call dispatched to node {}: ",
+                                    node_id)
+                     << FuncCallHelper::DebugString(func_call);
             dispatched = true;
             func_call_context->set_status(FuncCallContext::kSuccess);
         } else {
+            HVLOG(1) << "async func call node not found: "
+                     << FuncCallHelper::DebugString(func_call);
             func_call_context->set_status(FuncCallContext::kNotFound);
         }
         FinishFuncCall(std::move(parent_connection), func_call_context);

@@ -41,6 +41,8 @@ type Environment interface {
 	SharedLogSetAuxData(ctx context.Context, seqNum uint64, auxData []byte) error
 	// Conditional append, succeed only if the position of this log on the stream of `condTag` equals to `condPos`
 	SharedLogConditionalAppend(ctx context.Context, tags []uint64, data []byte, condTag uint64, condPos uint32) ( /* seqnum */ uint64, error)
+	// Overwrite a log entry, used for callee to write to a position specified by the caller
+	SharedLogOverwrite(ctx context.Context, tag uint64, pos uint32, data []byte) error
 }
 
 type FuncHandler interface {

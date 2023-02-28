@@ -23,7 +23,7 @@ class Engine;
 namespace log {
 
 struct LocalOp {
-    bool is_cond_op;
+    bool conditional;
     protocol::SharedLogOpType type;
     uint16_t client_id;
     uint32_t call_id;
@@ -55,14 +55,16 @@ NewCCReplicateMessage(log::LocalOp* op)
     message.op_type = static_cast<uint16_t>(op->type);
     message.localid = op->localid;
     message.num_tags = gsl::narrow_cast<uint16_t>(op->user_tags.size());
-    // all history tags must be cond tags too
-    if (op->is_cond_op) {
-        message.cond_tag = op->cond_tag;
-        message.cond_pos = op->cond_pos;
-        // not actually used, if non-zero cond_tag implies this is a log of a cond op
-        message.flags |= protocol::kSLogIsCondOpFlag;
-    }
-    // else, cond_tag=0(kEmtpy)
+    message.cond_tag = op->cond_tag;
+    message.cond_pos = op->cond_pos;
+    // // all history tags must be cond tags too
+    // if (op->cond_tag != kEmptyLogTag) {
+    //     message.cond_tag = op->cond_tag;
+    //     message.cond_pos = op->cond_pos;
+    //     // if (op->conditional) {
+    //     //     message.flags |= protocol::kSLogIsCondOpFlag;
+    //     // } // else this is a overwrite op
+    // }
     return message;
 }
 
@@ -173,6 +175,7 @@ protected:
     // virtual void HandleLocalCCTxnStart(LocalOp* op) = 0;
     virtual void HandleLocalCCTxnCommit(LocalOp* op) = 0;
     virtual void HandleLocalCCTxnWrite(LocalOp* op) = 0;
+    // virtual void HandleLocalOverwrite(LocalOp* op) = 0;
 
     void LocalOpHandler(LocalOp* op);
 

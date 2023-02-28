@@ -107,14 +107,15 @@ enum class SharedLogOpType : uint16_t {
     CC_TXN_START = 0x07,  // FuncWorker to Engine, Engine to Storage
     CC_TXN_COMMIT = 0x08, // FuncWorker to Engine
     CC_TXN_WRITE = 0x09,  // FuncWorker to Engine, Engine to Storage
-    CC_READ_LOG = 0x0a,   // Engine to Storage
-    CC_READ_KVS = 0x0b,   // Engine to Storage
+    OVERWRITE = 0x0a,     // FuncWorker to Engine, Engine to Storage
     READ_AT = 0x10,       // Index to Storage
     REPLICATE = 0x11,     // Engine to Storage
     INDEX_DATA = 0x12,    // Engine to Index
     SHARD_PROG = 0x13,    // Storage to Sequencer
     METALOG = 0x14,       // Sequencer to Sequencer, Engine, Storage, Index
     META_PROG = 0x15,     // Sequencer to Sequencer
+    CC_READ_LOG = 0x16,   // Engine to Storage
+    CC_READ_KVS = 0x17,   // Engine to Storage
     RESPONSE = 0x20,
 };
 
@@ -133,6 +134,7 @@ enum class SharedLogResultType : uint16_t {
     EMPTY = 0x32,     // Cannot find log entries satisfying requirements
     DATA_LOST = 0x33, // Failed to extract log data
     TRIM_FAILED = 0x34,
+    COND_FAILED = 0x35,
 };
 
 constexpr uint64_t kInvalidLogTag = std::numeric_limits<uint64_t>::max();
@@ -142,7 +144,7 @@ constexpr uint64_t kInvalidLogSeqNum = std::numeric_limits<uint64_t>::max();
 constexpr uint32_t kFuncWorkerUseEngineSocketFlag = (1 << 0);
 constexpr uint32_t kUseFifoForNestedCallFlag = (1 << 1);
 constexpr uint32_t kAsyncInvokeFuncFlag = (1 << 2);
-constexpr uint32_t kMsgIsCondOpFlag = (1 << 3);
+constexpr uint32_t kConditionalOpFlag = (1 << 3);
 
 struct Message {
     struct {
@@ -245,8 +247,7 @@ struct GatewayMessage {
 static_assert(sizeof(GatewayMessage) == 16, "Unexpected GatewayMessage size");
 
 constexpr uint16_t kReadInitialFlag = (1 << 0);
-constexpr uint16_t kSLogIsCondOpFlag = (1 << 1);
-// constexpr uint16_t kSLogIsReplicateOpFlag = (1 << 2);
+constexpr uint16_t kIndexIsTxnFlag = (1 << 1);
 
 struct SharedLogMessage {
     uint16_t op_type; // [0:2]
