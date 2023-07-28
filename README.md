@@ -35,11 +35,11 @@ The `src` directory includes Halfmoon's modifications to Boki's logging layer. W
 
 The `workers/golang` directory includes client-side wrapper codes that communicates with the logging layer and exports the log APIs to Go programs.
 
-The Halfmoon protocols are implemented in the `workloads/workflow` in [TODO](xxx).
+The Halfmoon protocols are implemented in the `workloads/workflow` in [pkusys/Halfmoon-bench](https://github.com/pkusys/Halfmoon-bench).
 
 ### Running Halfmoon's evaluation workloads ###
 
-The [TODO](xxx) repository includes experiment scripts and detailed instructions on running evaluation workloads presented in our SOSP '23 paper.
+The [pkusys/Halfmoon-bench](https://github.com/pkusys/Halfmoon-bench) repository includes experiment scripts and detailed instructions on running evaluation workloads presented in our SOSP '23 paper.
 
 ### Limitations of the current prototype ###
 
